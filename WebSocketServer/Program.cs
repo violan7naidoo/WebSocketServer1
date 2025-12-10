@@ -20,7 +20,7 @@ class Program
         Console.WriteLine("Starting Game WebSocket server on ws://0.0.0.0:5000/ws...");
 
         var builder = WebApplication.CreateBuilder(args);
-        builder.WebHost.UseUrls("http://0.0.0.0:5000");
+        builder.WebHost.UseUrls("http://localhost:5000");
         builder.Services.AddWebSockets(_ => { });
 
         var app = builder.Build();
@@ -134,28 +134,52 @@ class Program
                         Console.WriteLine($"Spin completed: {message}");
                     }
 
-                    // Handle AFT_DEPOSIT
+                    // Handle AFT_DEPOSIT from EGM - forward to clients
                     else if (data.TryGetProperty("EventType", out var eventType2) &&
                              eventType2.GetString() == "AFT_DEPOSIT")
                     {
-                        // Simply forward the credit update message
-                        await BroadcastMessageAsync(message);
+                        // Forward AFT deposit message to clients
+                        await BroadcastToClientsOnlyAsync(message);
+                        Console.WriteLine($"Forwarded AFT_DEPOSIT to clients: {message}");
                     }
 
-                    // Handle BILL_INSERTED
+                    // Handle BILL_INSERTED from EGM - forward to clients
                     else if (data.TryGetProperty("EventType", out var eventType3) &&
                              eventType3.GetString() == "BILL_INSERTED")
                     {
-                        // Simply forward the credit update message
-                        await BroadcastMessageAsync(message);
+                        // Forward bill inserted message to clients
+                        await BroadcastToClientsOnlyAsync(message);
+                        Console.WriteLine($"Forwarded BILL_INSERTED to clients: {message}");
                     }
 
-                    // Handle AFT_CASHOUT
+                    // Handle AFT_CASHOUT from EGM - forward to clients
                     else if (data.TryGetProperty("EventType", out var eventType4) &&
                              eventType4.GetString() == "AFT_CASHOUT")
                     {
-                        // Forward credit updates
-                        await BroadcastMessageAsync(message);
+                        // Forward AFT cashout message to clients
+                        await BroadcastToClientsOnlyAsync(message);
+                        Console.WriteLine($"Forwarded AFT_CASHOUT to clients: {message}");
+                    }
+
+                    // Handle AFT_CONFIRMED from CLIENT - send back to EGM
+                    else if (data.TryGetProperty("eventType", out var eventType5) &&
+                             eventType5.GetString() == "AFT_CONFIRMED")
+                    {
+                        // Convert client message format to EGM format and send to EGM
+                        bool confirmed = true;
+                        if (data.TryGetProperty("confirmed", out var confirmedProp))
+                        {
+                            confirmed = confirmedProp.GetBoolean();
+                        }
+
+                        string transferId = "";
+                        if (data.TryGetProperty("transferId", out var transferIdProp))
+                        {
+                            transferId = transferIdProp.GetString();
+                        }
+
+                        await SendAFTConfirmationToEGMAsync(confirmed, transferId);
+                        Console.WriteLine($"Received AFT_CONFIRMED from client, forwarding to EGM: {message}");
                     }
 
                     // Handle connection test messages
@@ -215,6 +239,54 @@ class Program
         }
     }
 
+    // NEW: Broadcast only to clients (not to EGM)
+    static async Task BroadcastToClientsOnlyAsync(string message)
+    {
+        var bytes = Encoding.UTF8.GetBytes(message);
+        var currentClients = new List<WebSocket>(clients);
+
+        foreach (var client in currentClients)
+        {
+            if (client.State == WebSocketState.Open)
+            {
+                try
+                {
+                    await client.SendAsync(
+                        new ArraySegment<byte>(bytes),
+                        WebSocketMessageType.Text,
+                        true,
+                        CancellationToken.None
+                    );
+                    Console.WriteLine($"Sent to client: {message}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error sending to client: {ex.Message}");
+                    clients.Remove(client);
+                }
+            }
+        }
+    }
+
+    // NEW: Method to send AFT confirmation specifically to EGM
+    public static async Task SendAFTConfirmationToEGMAsync(bool confirmed, string transferId = "")
+    {
+        var aftConfirmation = new AFTConfirmationMessage
+        {
+            EventType = "AFT_CONFIRMED",
+            Confirmed = confirmed,
+            TransferId = transferId,
+            Timestamp = DateTime.UtcNow
+        };
+
+        var jsonMessage = JsonSerializer.Serialize(aftConfirmation);
+        
+        // In a real implementation, you would need to identify which connection is the EGM
+        // For now, we'll broadcast to all connections (including EGM)
+        await BroadcastMessageAsync(jsonMessage);
+        Console.WriteLine($"Sent AFT confirmation to EGM: {jsonMessage}");
+    }
+
     // Helper method to send spin completion messages (can be called from EGM)
     public static async Task SendSpinCompletedAsync(int betAmount, int winAmount, decimal currentCredits, string status = "SUCCESS")
     {
@@ -249,7 +321,7 @@ public class GameResponse
     public DateTime Timestamp { get; set; }
 }
 
-//  model for spin completion messages
+// Model for spin completion messages
 public class SpinCompletedMessage
 {
     public string EventType { get; set; }
@@ -265,5 +337,14 @@ public class CreditUpdateMessage
 {
     public string EventType { get; set; } = "CREDIT_UPDATE";
     public decimal CurrentCredits { get; set; }
+    public DateTime Timestamp { get; set; }
+}
+
+// Model for AFT confirmation messages
+public class AFTConfirmationMessage
+{
+    public string EventType { get; set; } = "AFT_CONFIRMED";
+    public bool Confirmed { get; set; }
+    public string TransferId { get; set; }
     public DateTime Timestamp { get; set; }
 }
