@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -13,11 +14,26 @@ using Microsoft.AspNetCore.WebSockets;
 class Program
 {
     private static readonly List<WebSocket> clients = new();
-    private static readonly ConcurrentQueue<string> messageQueue = new();
+    private static readonly ConcurrentQueue<(string message, WebSocket sender)> messageQueue = new();
+    private static readonly ConcurrentDictionary<WebSocket, string> clientTypes = new(); // Track EGM vs Roulette
+    private static bool _sessionInitialized = false; // Track if session was initialized
+
+    // --- STORAGE FOR ROULETTE MESSAGES ---
+    // Store all Roulette messages (except round_result which triggers GAME_UPDATE to EGM)
+    private static readonly ConcurrentQueue<(string eventType, string message, DateTime timestamp)> storedRouletteMessages = new();
+
+    // --- STATE MANAGEMENT ---
+    // Stores the bet amount from 'bet_commit' until 'round_result' arrives
+    private static int _pendingBetStake = 0;
+    private static bool _isRoundActive = false;
+    private static long _sequenceCounter = 0; // Sequence counter for events
+    private static decimal _currentEgmBalance = 0; // Track current EGM balance
+    private static int _coinsIn = 0; // Track coins in meter
+    private static int _gamesPlayed = 0; // Track games played meter
 
     static async Task Main(string[] args)
     {
-        Console.WriteLine("Starting Game WebSocket server on ws://0.0.0.0:5000/ws...");
+        Console.WriteLine("Starting Adapter WebSocket Server on ws://0.0.0.0:5000/ws...");
 
         var builder = WebApplication.CreateBuilder(args);
         builder.WebHost.UseUrls("http://localhost:5000");
@@ -55,43 +71,71 @@ class Program
     static async Task HandleWebSocketAsync(WebSocket webSocket)
     {
         var buffer = new byte[1024 * 4];
-        Console.WriteLine("Game client connected.");
         clients.Add(webSocket);
+        
+        // Connection validation and logging
+        int egmCount = clientTypes.Values.Count(v => v == "EGM");
+        int rouletteCount = clientTypes.Values.Count(v => v == "ROULETTE");
+        int unknownCount = clients.Count - egmCount - rouletteCount;
+        
+        Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+        Console.WriteLine($"║  🔌 CLIENT CONNECTED                                          ║");
+        Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+        Console.WriteLine($"║  Total Clients:    {clients.Count} (Expected: 2){"".PadRight(35)}║");
+        Console.WriteLine($"║  EGM Clients:      {egmCount}{"".PadRight(45)}║");
+        Console.WriteLine($"║  Roulette Clients: {rouletteCount}{"".PadRight(45)}║");
+        Console.WriteLine($"║  Unknown Clients:  {unknownCount}{"".PadRight(45)}║");
+        if (clients.Count > 2)
+        {
+            Console.WriteLine($"║  ⚠ WARNING: More than 2 clients connected!{"".PadRight(20)}║");
+        }
+        Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
 
         try
         {
             while (webSocket.State == WebSocketState.Open)
             {
-                var result = await webSocket.ReceiveAsync(
-                    new ArraySegment<byte>(buffer),
-                    CancellationToken.None
-                );
+                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
 
                 if (result.MessageType == WebSocketMessageType.Text)
                 {
                     var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    Console.WriteLine($"Received: {message}");
-                    messageQueue.Enqueue(message);
+                    // Get client type for logging
+                    string clientType = clientTypes.TryGetValue(webSocket, out var type) ? type : "UNKNOWN";
+                    Console.WriteLine($"[RECEIVED] From {clientType}: {message}");
+                    messageQueue.Enqueue((message, webSocket));
                 }
                 else if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    Console.WriteLine("Game client disconnected.");
+                    Console.WriteLine("[DISCONNECTION] Client disconnected.");
                     break;
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"WebSocket error: {ex.Message}");
+            Console.WriteLine($"[ERROR] WebSocket error: {ex.Message}");
         }
         finally
         {
+            string disconnectedType = clientTypes.TryGetValue(webSocket, out var dt) ? dt : "UNKNOWN";
             clients.Remove(webSocket);
-            await webSocket.CloseAsync(
-                WebSocketCloseStatus.NormalClosure,
-                "Closing",
-                CancellationToken.None
-            );
+            clientTypes.TryRemove(webSocket, out _);
+            
+            egmCount = clientTypes.Values.Count(v => v == "EGM");
+            rouletteCount = clientTypes.Values.Count(v => v == "ROULETTE");
+            
+            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║  🔌 CLIENT DISCONNECTED                                      ║");
+            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+            Console.WriteLine($"║  Disconnected Type: {disconnectedType.PadRight(40)}║");
+            Console.WriteLine($"║  Remaining Clients: {clients.Count}{"".PadRight(42)}║");
+            Console.WriteLine($"║  EGM Clients:       {egmCount}{"".PadRight(45)}║");
+            Console.WriteLine($"║  Roulette Clients:  {rouletteCount}{"".PadRight(45)}║");
+            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+            
+            if (webSocket.State != WebSocketState.Closed)
+                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
         }
     }
 
@@ -99,118 +143,881 @@ class Program
     {
         while (true)
         {
-            if (messageQueue.TryDequeue(out string message))
+            if (messageQueue.TryDequeue(out var item))
             {
+                var (message, sender) = item;
                 try
                 {
-                    // Parse the message as a dynamic object to access properties directly
-                    var data = JsonSerializer.Deserialize<JsonElement>(message);
+                    using var doc = JsonDocument.Parse(message);
+                    var root = doc.RootElement;
 
-                    // Check if it's a SPIN message
-                    if (data.TryGetProperty("eventType", out var eventType) &&
-                        eventType.GetString() == "SPIN" &&
-                        data.TryGetProperty("betAmount", out var betAmount) &&
-                        data.TryGetProperty("winAmount", out var winAmount))
+                    // We check for "EventType" (PascalCase), "eventType" (camelCase), and "event" (lowercase)
+                    string eventType = "";
+                    if (root.TryGetProperty("EventType", out var et)) eventType = et.GetString();
+                    else if (root.TryGetProperty("eventType", out var et2)) eventType = et2.GetString();
+                    else if (root.TryGetProperty("event", out var ev)) eventType = ev.GetString();
+
+                    // Identify client type based on first message
+                    // IMPORTANT: Check Roulette events FIRST to avoid misidentifying Roulette clients as EGM
+                    // Also allow re-identification if a client was misidentified
+                    bool needsIdentification = !clientTypes.ContainsKey(sender);
+                    bool needsReidentification = clientTypes.TryGetValue(sender, out var currentType) && 
+                                                 currentType == "EGM" && 
+                                                 (eventType == "bet_commit" || eventType == "round_result" || eventType == "round_state" || 
+                                                  eventType == "cash_event" || eventType == "aft_transfer" || eventType == "AFT_CONFIRMED" || 
+                                                  eventType == "cashout" || eventType == "round_summary" || eventType == "refund" || 
+                                                  eventType == "round_void" || eventType == "error" || eventType == "ui_pong");
+                    
+                    if (needsIdentification || needsReidentification)
                     {
-                        // Create response with the actual values
-                        var response = new GameResponse
+                        // Check for Roulette-specific events FIRST (these are definitive)
+                        if (eventType == "bet_commit" || 
+                            eventType == "round_result" || 
+                            eventType == "round_state" || 
+                            eventType == "cash_event" || 
+                            eventType == "aft_transfer" || 
+                            eventType == "AFT_CONFIRMED" || 
+                            eventType == "cashout" || 
+                            eventType == "round_summary" || 
+                            eventType == "refund" || 
+                            eventType == "round_void" || 
+                            eventType == "error" || 
+                            eventType == "ui_pong")
                         {
-                            EventType = "GAME_UPDATE",
-                            BetAmount = betAmount.GetInt32(),
-                            WinAmount = winAmount.GetInt32(),
-                            Timestamp = DateTime.UtcNow
+                            if (needsReidentification)
+                            {
+                                Console.WriteLine($"[RE-IDENTIFY] Client was misidentified as EGM, correcting to ROULETTE");
+                            }
+                            clientTypes[sender] = "ROULETTE";
+                            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: ROULETTE                                  ║");
+                            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+                            Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
+                            Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
+                            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+                        }
+                        // Check for EGM-specific events (definitive EGM events) - only if not already Roulette
+                        else if (needsIdentification && (eventType == "BILL_INSERTED" || 
+                                eventType == "AFT_DEPOSIT" || 
+                                eventType == "AFT_CASHOUT" || 
+                                eventType == "SPIN_COMPLETED" || 
+                                eventType == "ui_ping" || 
+                                eventType == "UI_PING" ||
+                                eventType == "CONNECTION_TEST"))
+                        {
+                            clientTypes[sender] = "EGM";
+                            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: EGM                                      ║");
+                            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+                            Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
+                            Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
+                            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+                            
+                            // Extract available credits if present in the message
+                            decimal availableCredits = 0;
+                            if (root.TryGetProperty("CurrentCredits", out var credits))
+                                availableCredits = credits.GetDecimal();
+                            else if (root.TryGetProperty("payload", out var payload2) && payload2.TryGetProperty("availableCredits", out var availCredits))
+                                availableCredits = availCredits.GetDecimal();
+                            
+                            // Send session_initialized to Roulette client when EGM connects
+                            await SendSessionInitializedAsync(sender, availableCredits);
+                        }
+                        // Handle session_initialized - check context to determine client type
+                        else if (needsIdentification && eventType == "session_initialized")
+                        {
+                            // Check if it has "client" field indicating EGM
+                            if (root.TryGetProperty("client", out var clientField) && clientField.GetString() == "EGM_Application")
+                            {
+                                clientTypes[sender] = "EGM";
+                                Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+                                Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: EGM                                      ║");
+                                Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+                                Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
+                                Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
+                                Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+                                
+                                // Extract available credits
+                                decimal availableCredits = 0;
+                                if (root.TryGetProperty("payload", out var payload3) && payload3.TryGetProperty("availableCredits", out var availCredits2))
+                                    availableCredits = availCredits2.GetDecimal();
+                                
+                                await SendSessionInitializedAsync(sender, availableCredits);
+                            }
+                            // Otherwise, wait for more definitive events (don't identify yet)
+                            // Roulette clients will send round_state/bet_commit next, EGM will send ui_ping
+                        }
+                    }
+
+                    // =======================================================================
+                    //  1. OUTBOUND: EGM -> ROULETTE (Translation Layer)
+                    // =======================================================================
+
+                    if (eventType == "BILL_INSERTED")
+                    {
+                        // Extract Data from EGM Message
+                        decimal amount = 0;
+                        decimal currentCredits = 0;
+                        string egmId = "EGM-0441"; // Default, can be extracted if available
+                        
+                        if (root.TryGetProperty("amount", out var amt)) amount = amt.GetDecimal();
+                        if (root.TryGetProperty("CurrentCredits", out var cc)) currentCredits = cc.GetDecimal();
+                        if (root.TryGetProperty("egmId", out var egmIdProp)) egmId = egmIdProp.GetString();
+
+                        Console.WriteLine($"[TRANSLATE] EGM -> Roulette: BILL_INSERTED received");
+                        Console.WriteLine($"[TRANSLATE]   Amount: {amount} ZAR, Current Credits: {currentCredits}");
+
+                        // Generate required fields
+                        string roundId = $"round-{DateTime.UtcNow.Ticks}";
+                        long sequence = Interlocked.Increment(ref _sequenceCounter);
+                        string bvSerial = "BV-INTERNAL"; // Default, can be extracted if available
+                        int denomination = (int)(amount * 100); // Convert to cents
+
+                        // Update tracked EGM balance and meters
+                        _currentEgmBalance = currentCredits;
+                        _coinsIn += denomination; // Add to coins in meter
+                        int bvStackerCount = 1; // Default, can be tracked if needed
+                        int sequenceNumber = (int)(DateTime.UtcNow.Ticks % 1000000); // Bill validator sequence
+                        int cashin = denomination; // Total cash in (for this transaction, could track cumulative)
+
+                        // Create Roulette Spec "cash_event" matching expected format
+                        var cashEvent = new
+                        {
+                            @event = "cash_event",
+                            roundId = roundId,
+                            egmId = egmId,
+                            sequence = sequence,
+                            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                            nonce = Guid.NewGuid().ToString(),
+                            payload = new
+                            {
+                                type = "bv_stack",
+                                bvSerial = bvSerial,
+                                denomination = denomination,
+                                currency = "ZAR",
+                                bvStackerCount = bvStackerCount,
+                                sequenceNumber = sequenceNumber,
+                                meters = new
+                                {
+                                    cashin = cashin,
+                                    credits = (int)currentCredits
+                                }
+                            }
                         };
 
-                        var jsonResponse = JsonSerializer.Serialize(response);
-                        await BroadcastMessageAsync(jsonResponse);
+                        string json = JsonSerializer.Serialize(cashEvent);
+                        Console.WriteLine($"[TRANSLATE]   Converting to: cash_event");
+                        Console.WriteLine($"[TRANSLATE]   RoundId: {roundId}, Denomination: {denomination} cents, Credits: {currentCredits}");
+                        // Send to Roulette client only
+                        await BroadcastToRouletteClientsAsync(json, sender, "cash_event");
+                        
+                        // Send balance_snapshot after credit update
+                        await SendBalanceSnapshotAsync(sender, currentCredits, egmId);
+                    }
+                    else if (eventType == "AFT_DEPOSIT")
+                    {
+                        // Extract Data from EGM Message
+                        decimal amount = 0;
+                        decimal currentCredits = 0;
+                        string aftReference = "";
+                        string egmId = "EGM-0441"; // Default, can be extracted if available
+
+                        if (root.TryGetProperty("Amount", out var amt)) amount = amt.GetDecimal();
+                        if (root.TryGetProperty("CurrentCredits", out var cc)) currentCredits = cc.GetDecimal();
+                        if (root.TryGetProperty("AFTReference", out var refProp)) aftReference = refProp.GetString();
+                        if (root.TryGetProperty("egmId", out var egmIdProp)) egmId = egmIdProp.GetString();
+
+                        // Update tracked EGM balance
+                        _currentEgmBalance = currentCredits;
+
+                        // Generate IDs if not provided
+                        string aftTxnId = !string.IsNullOrEmpty(aftReference) ? aftReference : $"AFT-TXN-{DateTime.UtcNow.Ticks}";
+                        string authCode = !string.IsNullOrEmpty(aftReference) ? $"AUTH-{aftReference.Substring(Math.Max(0, aftReference.Length - 8))}" : $"AUTH-{Guid.NewGuid().ToString().Substring(0, 8).ToUpper()}";
+                        string roundId = $"round-{DateTime.UtcNow.Ticks}";
+                        long sequence = Interlocked.Increment(ref _sequenceCounter); // Increment sequence counter
+
+                        Console.WriteLine($"[TRANSLATE] EGM -> Roulette: AFT_DEPOSIT received");
+                        Console.WriteLine($"[TRANSLATE]   Amount: {amount}, Current Credits: {currentCredits}, Reference: {aftReference}");
+
+                        // Create Roulette Spec "aft_transfer" matching expected format
+                        var aftEvent = new
+                        {
+                            @event = "aft_transfer",
+                            roundId = roundId,
+                            egmId = egmId,
+                            sequence = sequence,
+                            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                            nonce = Guid.NewGuid().ToString(),
+                            payload = new
+                            {
+                                aftTxnId = aftTxnId,
+                                originHost = "EGM-LOCAL",
+                                amount = (int)amount, // Convert to int as expected
+                                authCode = authCode,
+                                remainingBalance = (int)currentCredits // Convert to int as expected
+                            }
+                        };
+
+                        string json = JsonSerializer.Serialize(aftEvent);
+                        Console.WriteLine($"[TRANSLATE]   Converting to: aft_transfer");
+                        Console.WriteLine($"[TRANSLATE]   RoundId: {roundId}, AFT TxnId: {aftTxnId}, AuthCode: {authCode}");
+                        // Send to Roulette client only
+                        await BroadcastToRouletteClientsAsync(json, sender, "aft_transfer");
+                        
+                        // Send balance_snapshot after credit update
+                        await SendBalanceSnapshotAsync(sender, currentCredits, egmId);
+                    }
+                    else if (eventType == "AFT_CASHOUT")
+                    {
+                        // Extract data from EGM Message
+                        decimal currentCredits = 0;
+                        decimal amount = 0;
+                        string egmId = "EGM-0441";
+                        int bet = 0;
+                        int win = 0;
+                        
+                        if (root.TryGetProperty("CurrentCredits", out var cc)) currentCredits = cc.GetDecimal();
+                        if (root.TryGetProperty("Amount", out var amt)) amount = amt.GetDecimal();
+                        if (root.TryGetProperty("egmId", out var egmIdProp)) egmId = egmIdProp.GetString();
+                        
+                        // Try to extract bet and win if available in the message
+                        if (root.TryGetProperty("BetAmount", out var betProp)) bet = betProp.GetInt32();
+                        if (root.TryGetProperty("WinAmount", out var winProp)) win = winProp.GetInt32();
+                        
+                        // Calculate balance before and after cashout
+                        decimal egmBalanceBefore = _currentEgmBalance;
+                        decimal egmBalanceAfter = 0; // After cashout, balance should be 0
+                        
+                        // Generate roundId
+                        string roundId = $"round-{DateTime.UtcNow.Ticks}";
+                        long sequence = Interlocked.Increment(ref _sequenceCounter);
+                        
+                        // Update tracked EGM balance (set to 0 after cashout)
+                        _currentEgmBalance = 0;
+                        
+                        Console.WriteLine($"[TRANSLATE] EGM -> Roulette: AFT_CASHOUT received");
+                        Console.WriteLine($"[TRANSLATE]   Amount: {amount}, Current Credits: {currentCredits}, Balance Before: {egmBalanceBefore}");
+                        
+                        // Create cashout_ack event matching expected format
+                        var cashoutAck = new
+                        {
+                            @event = "cashout_ack",
+                            roundId = roundId,
+                            egmId = egmId,
+                            sequence = sequence,
+                            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                            nonce = Guid.NewGuid().ToString(),
+                            payload = new
+                            {
+                                roundId = roundId,
+                                accepted = true,
+                                reason = (string)null, // null if accepted
+                                bet = bet,
+                                win = win,
+                                egmBalanceBefore = (int)egmBalanceBefore,
+                                egmBalanceAfter = (int)egmBalanceAfter
+                            }
+                        };
+                        
+                        string json = JsonSerializer.Serialize(cashoutAck);
+                        Console.WriteLine($"[TRANSLATE]   Converting to: cashout_ack");
+                        Console.WriteLine($"[TRANSLATE]   RoundId: {roundId}, Bet: {bet}, Win: {win}, Balance Before: {egmBalanceBefore}, Balance After: {egmBalanceAfter}");
+                        // Send to Roulette client only
+                        await BroadcastToRouletteClientsAsync(json, sender, "cashout_ack");
+                        
+                        // Send balance_snapshot after cashout (balance is now 0)
+                        await SendBalanceSnapshotAsync(sender, 0, egmId);
+                    }
+                    else if (eventType == "ui_ping" || eventType == "UI_PING")
+                    {
+                        // Extract EGM ID if available
+                        string egmId = "EGM-0441";
+                        if (root.TryGetProperty("egmId", out var egmIdProp)) egmId = egmIdProp.GetString();
+
+                        Console.WriteLine($"[PING] Received ui_ping from EGM");
+
+                        // Translate to Roulette format
+                        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                        long sequence = Interlocked.Increment(ref _sequenceCounter);
+                        
+                        // Extract timestamp from payload if available, otherwise use current time
+                        long payloadTimestamp = timestamp;
+                        if (root.TryGetProperty("payload", out var pingPayload))
+                        {
+                            if (pingPayload.TryGetProperty("timestamp", out var ts))
+                            {
+                                if (ts.ValueKind == JsonValueKind.Number)
+                                    payloadTimestamp = ts.GetInt64();
+                            }
+                        }
+                        
+                        var uiPing = new
+                        {
+                            @event = "ui_ping",
+                            egmId = egmId,
+                            sequence = sequence,
+                            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                            nonce = Guid.NewGuid().ToString(),
+                            payload = new
+                            {
+                                timestamp = payloadTimestamp
+                            }
+                        };
+                        
+                        string json = JsonSerializer.Serialize(uiPing);
+                        Console.WriteLine($"[PING] Translated ui_ping for Roulette (Timestamp: {payloadTimestamp})");
+                        
+                        // Send to all Roulette clients (exclude EGM sender)
+                        await BroadcastToRouletteClientsAsync(json, sender, "ui_ping");
                     }
 
-                    // Handle SPIN_COMPLETED message from EGM
-                    else if (data.TryGetProperty("EventType", out var eventTypeSpinCompleted) &&
-                             eventTypeSpinCompleted.GetString() == "SPIN_COMPLETED")
+                    // =======================================================================
+                    //  2. INBOUND: ROULETTE -> EGM (Game Logic Adapter)
+                    // =======================================================================
+                    // IMPORTANT: All Roulette messages are STORED in the WebSocket server.
+                    // ONLY round_result triggers GAME_UPDATE to be sent to EGM.
+                    // All other Roulette events (bet_commit, round_state, AFT_CONFIRMED, etc.)
+                    // are stored but NOT forwarded to EGM.
+                    // =======================================================================
+
+                    else if (eventType == "bet_commit")
                     {
-                        // Forward the spin completion message to clients
-                        await BroadcastMessageAsync(message);
-                        Console.WriteLine($"Spin completed: {message}");
+                        // Extract bet_commit data
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        int totalStake = 0;
+
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Try different possible field names for stake
+                            if (payload.TryGetProperty("totalStake", out var stake))
+                                totalStake = stake.GetInt32();
+                            else if (payload.TryGetProperty("localStake", out var localStake))
+                                totalStake = localStake.GetInt32();
+                            
+                            // Extract roundId from payload if not in root
+                            if (string.IsNullOrEmpty(roundId) && payload.TryGetProperty("roundId", out var payloadRoundId))
+                                roundId = payloadRoundId.GetString();
+                            
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: bet_commit received");
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, EGM ID: {egmId}, Total Stake: {totalStake}");
+                        
+                        // Store bet_commit message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("bet_commit", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored bet_commit message (Total stored: {storedRouletteMessages.Count})");
+
+                        if (totalStake > 0)
+                        {
+                            _pendingBetStake = totalStake;
+                                _isRoundActive = true;
+                            Console.WriteLine($"[ADAPTER] Bet Committed: {totalStake}. Waiting for result...");
+                            
+                            // Generate roundId if not provided
+                            if (string.IsNullOrEmpty(roundId))
+                                roundId = $"round-{DateTime.UtcNow.Ticks}";
+
+                            // Send bet_commit_ack to Roulette
+                            await SendBetCommitAckAsync(sender, roundId, egmId, totalStake);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[WARNING] bet_commit received but totalStake not found or invalid");
+                        }
+                    }
+                    else if (eventType == "round_result")
+                    {
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: round_result received");
+                        
+                        // Extract all round_result data
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        string layout = "";
+                        int winningNumber = 0;
+                        string sector = "";
+                        string ballLandingTime = "";
+                        int winAmount = 0;
+                        int netWin = 0;
+                        int balanceAfterWin = 0;
+                        string rngAlgorithm = "";
+                        string rngSeedHash = "";
+                        string rngNonce = "";
+                        int rngCallCount = 0;
+                        string rngSignature = "";
+                        string payoutBreakdownJson = "";
+
+                        // Extract from root level
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        // Extract from payload
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Extract roundId from payload if not in root
+                            if (string.IsNullOrEmpty(roundId) && payload.TryGetProperty("roundId", out var payloadRoundId))
+                                roundId = payloadRoundId.GetString();
+                            
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                            
+                            // Extract game result fields
+                            if (payload.TryGetProperty("layout", out var layoutProp)) layout = layoutProp.GetString();
+                            if (payload.TryGetProperty("winningNumber", out var wn)) winningNumber = wn.GetInt32();
+                            if (payload.TryGetProperty("sector", out var sec)) sector = sec.GetString();
+                            if (payload.TryGetProperty("ballLandingTime", out var blt)) ballLandingTime = blt.GetString();
+                            
+                            // Extract win amounts
+                            if (payload.TryGetProperty("winAmount", out var win)) winAmount = win.GetInt32();
+                            if (payload.TryGetProperty("netWin", out var nw)) netWin = nw.GetInt32();
+                            if (payload.TryGetProperty("balanceAfterWin", out var baw)) balanceAfterWin = baw.GetInt32();
+                            
+                            // Extract RNG proof
+                            if (payload.TryGetProperty("rngProof", out var rngProof))
+                            {
+                                if (rngProof.TryGetProperty("algorithm", out var alg)) rngAlgorithm = alg.GetString();
+                                if (rngProof.TryGetProperty("seedHash", out var sh)) rngSeedHash = sh.GetString();
+                                if (rngProof.TryGetProperty("nonce", out var rn)) rngNonce = rn.GetString();
+                                if (rngProof.TryGetProperty("callCount", out var cc)) rngCallCount = cc.GetInt32();
+                                if (rngProof.TryGetProperty("signature", out var sig)) rngSignature = sig.GetString();
+                            }
+                            
+                            // Extract payout breakdown
+                            if (payload.TryGetProperty("payoutBreakdown", out var pb))
+                            {
+                                payoutBreakdownJson = pb.ToString();
+                            }
+                        }
+
+                        // Log all extracted fields
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, EGM ID: {egmId}");
+                        Console.WriteLine($"[STORE]   Layout: {layout}, Winning Number: {winningNumber}, Sector: {sector}");
+                        Console.WriteLine($"[STORE]   Ball Landing Time: {ballLandingTime}");
+                        Console.WriteLine($"[STORE]   Win Amount: {winAmount}, Net Win: {netWin}, Balance After Win: {balanceAfterWin}");
+                        if (!string.IsNullOrEmpty(rngAlgorithm))
+                        {
+                            string seedHashPreview = !string.IsNullOrEmpty(rngSeedHash) && rngSeedHash.Length > 20 
+                                ? rngSeedHash.Substring(0, 20) + "..." 
+                                : rngSeedHash ?? "";
+                            Console.WriteLine($"[STORE]   RNG Proof: Algorithm={rngAlgorithm}, SeedHash={seedHashPreview}, Nonce={rngNonce}, CallCount={rngCallCount}");
+                        }
+                        if (!string.IsNullOrEmpty(payoutBreakdownJson))
+                        {
+                            Console.WriteLine($"[STORE]   Payout Breakdown: {payoutBreakdownJson}");
+                        }
+                        
+                        // Store round_result message
+                        storedRouletteMessages.Enqueue(("round_result", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored round_result message (Total stored: {storedRouletteMessages.Count})");
+                        
+                        if (_isRoundActive)
+                        {
+                            // COMBINE Saved Bet + New Win -> Standard EGM Format
+                            // ONLY round_result triggers GAME_UPDATE to EGM
+                            var gameUpdate = new GameResponse
+                            {
+                                EventType = "GAME_UPDATE",
+                                BetAmount = _pendingBetStake,
+                                WinAmount = winAmount,
+                                Timestamp = DateTime.UtcNow
+                            };
+
+                            string json = JsonSerializer.Serialize(gameUpdate);
+                            
+                            // Calculate EGM values (divide by 100 to convert from cents/smallest unit to actual credits)
+                            int betAmountForEGM = _pendingBetStake / 100;
+                            int winAmountForEGM = winAmount / 100;
+                            
+                            // Enhanced logging for GAME_UPDATE
+                            Console.WriteLine($"");
+                            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+                            Console.WriteLine($"║  🎮 GAME_UPDATE SENT TO EGM                                    ║");
+                            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+                            Console.WriteLine($"║  Event Type:    GAME_UPDATE{"".PadRight(40)}║");
+                            Console.WriteLine($"║  Round ID:      {roundId.PadRight(47)}║");
+                            Console.WriteLine($"║  EGM ID:        {egmId.PadRight(47)}║");
+                            Console.WriteLine($"║  ──────────────────────────────────────────────────────────── ║");
+                            Console.WriteLine($"║  Bet Amount:    {betAmountForEGM:N0} credits (raw: {_pendingBetStake:N0}){"".PadRight(20)}║");
+                            Console.WriteLine($"║  Win Amount:    {winAmountForEGM:N0} credits (raw: {winAmount:N0}){"".PadRight(21)}║");
+                            Console.WriteLine($"║  Net Result:    {(winAmountForEGM - betAmountForEGM):N0} credits{"".PadRight(34)}║");
+                            Console.WriteLine($"║  ──────────────────────────────────────────────────────────── ║");
+                            Console.WriteLine($"║  Game Result:   Number {winningNumber} ({sector}){"".PadRight(30)}║");
+                            Console.WriteLine($"║  Layout:        {layout.PadRight(47)}║");
+                            Console.WriteLine($"║  Timestamp:     {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC{"".PadRight(20)}║");
+                            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+                            Console.WriteLine($"");
+
+                            // Send GAME_UPDATE to EGM client only (this is the ONLY event sent to EGM from Roulette)
+                            // Use PascalCase format (EventType, BetAmount, WinAmount) to match EGM expectations
+                            
+                            var gameUpdateEvent = new
+                            {
+                                EventType = "GAME_UPDATE",
+                                BetAmount = betAmountForEGM,
+                                WinAmount = winAmountForEGM,
+                                Timestamp = DateTime.UtcNow,
+                                RoundId = roundId,
+                                EgmId = egmId
+                            };
+                            string eventJson = JsonSerializer.Serialize(gameUpdateEvent);
+                            await BroadcastToEGMClientsAsync(eventJson, sender, "GAME_UPDATE");
+
+                            // Update EGM balance: subtract bet, add win
+                            _currentEgmBalance = _currentEgmBalance - _pendingBetStake + winAmount;
+                            _gamesPlayed++; // Increment games played meter
+
+                            // Reset State
+                            _pendingBetStake = 0;
+                            _isRoundActive = false;
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[WARNING] round_result received but no active round (_isRoundActive = false)");
+                        }
+                    }
+                    else if (eventType == "round_summary")
+                    {
+                        // Extract round_summary data
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        string tableId = "";
+                        int totalPlayers = 0;
+                        int totalWagered = 0;
+                        int totalPaidOut = 0;
+                        double houseEdge = 0.0;
+                        int duration = 0;
+                        string timestamp = "";
+
+                        // Extract from root level
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        // Extract from payload
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Extract roundId from payload if not in root
+                            if (string.IsNullOrEmpty(roundId) && payload.TryGetProperty("roundId", out var payloadRoundId))
+                                roundId = payloadRoundId.GetString();
+                            
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                            
+                            // Extract summary statistics
+                            if (payload.TryGetProperty("tableId", out var tid)) tableId = tid.GetString();
+                            if (payload.TryGetProperty("totalPlayers", out var tp)) totalPlayers = tp.GetInt32();
+                            if (payload.TryGetProperty("totalWagered", out var tw)) totalWagered = tw.GetInt32();
+                            if (payload.TryGetProperty("totalPaidOut", out var tpo)) totalPaidOut = tpo.GetInt32();
+                            if (payload.TryGetProperty("houseEdge", out var he)) houseEdge = he.GetDouble();
+                            if (payload.TryGetProperty("duration", out var dur)) duration = dur.GetInt32();
+                            if (payload.TryGetProperty("timestamp", out var ts)) timestamp = ts.GetString();
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: round_summary received");
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, EGM ID: {egmId}, Table ID: {tableId}");
+                        Console.WriteLine($"[STORE]   Total Players: {totalPlayers}, Duration: {duration}ms");
+                        Console.WriteLine($"[STORE]   Total Wagered: {totalWagered:N0} credits, Total Paid Out: {totalPaidOut:N0} credits");
+                        Console.WriteLine($"[STORE]   House Edge: {houseEdge:F2}%, Timestamp: {timestamp}");
+                        
+                        // Store round_summary message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("round_summary", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored round_summary message (Total stored: {storedRouletteMessages.Count})");
+                    }
+                    else if (eventType == "refund")
+                    {
+                        // Extract refund data
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        int refundAmount = 0;
+                        string reason = "";
+                        int originalStake = 0;
+
+                        // Extract from root level
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        // Extract from payload
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Extract roundId from payload if not in root
+                            if (string.IsNullOrEmpty(roundId) && payload.TryGetProperty("roundId", out var payloadRoundId))
+                                roundId = payloadRoundId.GetString();
+                            
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                            
+                            // Extract refund details
+                            if (payload.TryGetProperty("refundAmount", out var ra)) refundAmount = ra.GetInt32();
+                            if (payload.TryGetProperty("reason", out var rsn)) reason = rsn.GetString();
+                            if (payload.TryGetProperty("originalStake", out var os)) originalStake = os.GetInt32();
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: refund received");
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, EGM ID: {egmId}");
+                        Console.WriteLine($"[STORE]   Refund Amount: {refundAmount:N0} credits, Original Stake: {originalStake:N0} credits");
+                        Console.WriteLine($"[STORE]   Reason: {reason}");
+                        
+                        // Store refund message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("refund", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored refund message (Total stored: {storedRouletteMessages.Count})");
+                    }
+                    else if (eventType == "round_void")
+                    {
+                        // Extract round_void data
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        string reason = "";
+                        string affectedEgmsJson = "";
+
+                        // Extract from root level
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        // Extract from payload
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Extract roundId from payload if not in root
+                            if (string.IsNullOrEmpty(roundId) && payload.TryGetProperty("roundId", out var payloadRoundId))
+                                roundId = payloadRoundId.GetString();
+                            
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                            
+                            // Extract void details
+                            if (payload.TryGetProperty("reason", out var rsn)) reason = rsn.GetString();
+                            
+                            // Extract affected EGMs array
+                            if (payload.TryGetProperty("affectedEgms", out var aegms))
+                            {
+                                affectedEgmsJson = aegms.ToString();
+                            }
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: round_void received");
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, EGM ID: {egmId}");
+                        Console.WriteLine($"[STORE]   Reason: {reason}");
+                        Console.WriteLine($"[STORE]   Affected EGMs: {affectedEgmsJson}");
+                        
+                        // Store round_void message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("round_void", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored round_void message (Total stored: {storedRouletteMessages.Count})");
+                    }
+                    else if (eventType == "error")
+                    {
+                        // Extract error data
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        string code = "";
+                        string errorMessage = "";
+                        string severity = "";
+                        string action = "";
+                        int required = 0;
+                        int available = 0;
+
+                        // Extract from root level
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        // Extract from payload
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Extract roundId from payload if not in root
+                            if (string.IsNullOrEmpty(roundId) && payload.TryGetProperty("roundId", out var payloadRoundId))
+                                roundId = payloadRoundId.GetString();
+                            
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                            
+                            // Extract error details
+                            if (payload.TryGetProperty("code", out var codeProp)) code = codeProp.GetString();
+                            if (payload.TryGetProperty("message", out var msgProp)) errorMessage = msgProp.GetString();
+                            if (payload.TryGetProperty("severity", out var sevProp)) severity = sevProp.GetString();
+                            if (payload.TryGetProperty("action", out var actProp)) action = actProp.GetString();
+                            
+                            // Extract details object
+                            if (payload.TryGetProperty("details", out var details))
+                            {
+                                if (details.TryGetProperty("required", out var req)) required = req.GetInt32();
+                                if (details.TryGetProperty("available", out var avail)) available = avail.GetInt32();
+                            }
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: error received");
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, EGM ID: {egmId}");
+                        Console.WriteLine($"[STORE]   Error Code: {code}, Severity: {severity}");
+                        Console.WriteLine($"[STORE]   Message: {errorMessage}");
+                        Console.WriteLine($"[STORE]   Action: {action}");
+                        if (required > 0 || available > 0)
+                        {
+                            Console.WriteLine($"[STORE]   Details: Required={required:N0} credits, Available={available:N0} credits");
+                        }
+                        
+                        // Store error message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("error", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored error message (Total stored: {storedRouletteMessages.Count})");
+                    }
+                    else if (eventType == "ui_pong")
+                    {
+                        // Extract ui_pong data
+                        string egmId = "EGM-0441";
+                        long timestamp = 0;
+                        long serverTime = 0;
+
+                        // Extract from root level
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        // Extract from payload
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                            
+                            // Extract timestamp and serverTime
+                            if (payload.TryGetProperty("timestamp", out var ts)) timestamp = ts.GetInt64();
+                            if (payload.TryGetProperty("serverTime", out var st)) serverTime = st.GetInt64();
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: ui_pong received");
+                        Console.WriteLine($"[STORE]   EGM ID: {egmId}");
+                        Console.WriteLine($"[STORE]   Timestamp: {timestamp}, Server Time: {serverTime}");
+                        
+                        // Store ui_pong message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("ui_pong", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored ui_pong message (Total stored: {storedRouletteMessages.Count})");
+                    }
+                    else if (eventType == "round_state")
+                    {
+                        // Extract round_state data from Roulette
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        string tableId = "";
+                        string state = "";
+                        string stateExpiresAt = "";
+                        int countdownMs = 0;
+                        string layoutSeed = "";
+                        string dealerId = "";
+
+                        // Extract from root level
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        // Extract from payload
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            if (payload.TryGetProperty("roundId", out var payloadRoundId)) roundId = payloadRoundId.GetString();
+                            if (payload.TryGetProperty("tableId", out var tid)) tableId = tid.GetString();
+                            if (payload.TryGetProperty("state", out var stateProp)) state = stateProp.GetString();
+                            if (payload.TryGetProperty("stateExpiresAt", out var sea)) stateExpiresAt = sea.GetString();
+                            if (payload.TryGetProperty("countdownMs", out var cd)) countdownMs = cd.GetInt32();
+                            if (payload.TryGetProperty("layoutSeed", out var ls)) layoutSeed = ls.GetString();
+                            if (payload.TryGetProperty("dealerId", out var did)) dealerId = did.GetString();
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: round_state received");
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, State: {state}, TableId: {tableId}");
+                        
+                        // Store round_state message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("round_state", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored round_state message (Total stored: {storedRouletteMessages.Count})");
                     }
 
-                    // Handle AFT_DEPOSIT from EGM - forward to clients
-                    else if (data.TryGetProperty("EventType", out var eventType2) &&
-                             eventType2.GetString() == "AFT_DEPOSIT")
-                    {
-                        // Forward AFT deposit message to clients
-                        await BroadcastToClientsOnlyAsync(message);
-                        Console.WriteLine($"Forwarded AFT_DEPOSIT to clients: {message}");
-                    }
+                    // =======================================================================
+                    //  3. EXISTING LOGIC (Pass-throughs)
+                    // =======================================================================
 
-                    // Handle BILL_INSERTED from EGM - forward to clients
-                    else if (data.TryGetProperty("EventType", out var eventType3) &&
-                             eventType3.GetString() == "BILL_INSERTED")
+                    // Pass-through SPIN_COMPLETED so UI knows animation finished
+                    else if (eventType == "SPIN_COMPLETED")
                     {
-                        // Forward bill inserted message to clients
-                        await BroadcastToClientsOnlyAsync(message);
-                        Console.WriteLine($"Forwarded BILL_INSERTED to clients: {message}");
+                        Console.WriteLine($"[FORWARD] Passing through SPIN_COMPLETED");
+                        // Forward to Roulette client (SPIN_COMPLETED comes from EGM)
+                        await BroadcastToRouletteClientsAsync(message, sender, "SPIN_COMPLETED");
                     }
-
-                    // Handle AFT_CASHOUT from EGM - forward to clients
-                    else if (data.TryGetProperty("EventType", out var eventType4) &&
-                             eventType4.GetString() == "AFT_CASHOUT")
+                    // Handle cashout - Store only, do not forward to EGM
+                    else if (eventType == "cashout")
                     {
-                        // Forward AFT cashout message to clients
-                        await BroadcastToClientsOnlyAsync(message);
-                        Console.WriteLine($"Forwarded AFT_CASHOUT to clients: {message}");
+                        // Extract cashout data
+                        string roundId = "";
+                        string egmId = "EGM-0441";
+                        string clientTs = "";
+
+                        if (root.TryGetProperty("roundId", out var rid)) roundId = rid.GetString();
+                        if (root.TryGetProperty("egmId", out var eid)) egmId = eid.GetString();
+                        
+                        if (root.TryGetProperty("payload", out var payload))
+                        {
+                            // Extract roundId from payload if not in root
+                            if (string.IsNullOrEmpty(roundId) && payload.TryGetProperty("roundId", out var payloadRoundId))
+                                roundId = payloadRoundId.GetString();
+                            
+                            // Extract egmId from payload if not in root
+                            if (egmId == "EGM-0441" && payload.TryGetProperty("egmId", out var payloadEgmId))
+                                egmId = payloadEgmId.GetString();
+                            
+                            // Extract clientTs from payload
+                            if (payload.TryGetProperty("clientTs", out var ct)) clientTs = ct.GetString();
+                        }
+
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: cashout received");
+                        Console.WriteLine($"[STORE]   RoundId: {roundId}, EGM ID: {egmId}, ClientTs: {clientTs}");
+                        
+                        // Store cashout message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("cashout", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored cashout message (Total stored: {storedRouletteMessages.Count})");
                     }
-
-                    // Handle AFT_CONFIRMED from CLIENT - send back to EGM
-                    else if (data.TryGetProperty("eventType", out var eventType5) &&
-                             eventType5.GetString() == "AFT_CONFIRMED")
+                    // Handle Confirmation - Store only, do not forward to EGM
+                    else if (eventType == "AFT_CONFIRMED")
                     {
-                        // Convert client message format to EGM format and send to EGM
                         bool confirmed = true;
-                        if (data.TryGetProperty("confirmed", out var confirmedProp))
-                        {
-                            confirmed = confirmedProp.GetBoolean();
-                        }
-
                         string transferId = "";
-                        if (data.TryGetProperty("transferId", out var transferIdProp))
-                        {
-                            transferId = transferIdProp.GetString();
-                        }
-
-                        await SendAFTConfirmationToEGMAsync(confirmed, transferId);
-                        Console.WriteLine($"Received AFT_CONFIRMED from client, forwarding to EGM: {message}");
+                        // Basic parsing for the properties...
+                        if (root.TryGetProperty("confirmed", out var cp)) confirmed = cp.GetBoolean();
+                        if (root.TryGetProperty("transferId", out var tid)) transferId = tid.GetString();
+                        
+                        Console.WriteLine($"[STORE] Roulette -> WebSocket: AFT_CONFIRMED received");
+                        Console.WriteLine($"[STORE]   Confirmed: {confirmed}, TransferId: {transferId}");
+                        
+                        // Store AFT_CONFIRMED message (do not forward to EGM)
+                        storedRouletteMessages.Enqueue(("AFT_CONFIRMED", message, DateTime.UtcNow));
+                        Console.WriteLine($"[STORE]   Stored AFT_CONFIRMED message (Total stored: {storedRouletteMessages.Count})");
                     }
-
-                    // Handle connection test messages
-                    else if (data.TryGetProperty("eventType", out var eventTypeTest) &&
-                             (eventTypeTest.GetString() == "CONNECTION_TEST" ||
-                              eventTypeTest.GetString() == "TEST_RESPONSE"))
+                    // Store/Log other unknown events from Roulette
+                    else
                     {
-                        // Respond to connection tests
-                        var testResponse = new
+                        // Check if this is from a Roulette client
+                        if (clientTypes.ContainsKey(sender) && clientTypes[sender] == "ROULETTE")
                         {
-                            eventType = "CONNECTION_TEST_RESPONSE",
-                            message = "Server is alive and connected",
-                            timestamp = DateTime.UtcNow,
-                            originalMessage = message
-                        };
-
-                        var testJson = JsonSerializer.Serialize(testResponse);
-                        await BroadcastMessageAsync(testJson);
+                            Console.WriteLine($"[STORE] Roulette -> WebSocket: Unknown event '{eventType}' received");
+                            storedRouletteMessages.Enqueue((eventType, message, DateTime.UtcNow));
+                            Console.WriteLine($"[STORE]   Stored '{eventType}' message (Total stored: {storedRouletteMessages.Count})");
+                        }
+                    else
+                    {
+                        Console.WriteLine($"[STORE] Storing event: {eventType} for log/audit.");
+                        }
                     }
+
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Error processing message: {ex.Message}");
-                    // Don't re-queue malformed messages to avoid infinite loops
-                    Console.WriteLine($"Dropping malformed message: {message}");
                 }
             }
-            await Task.Delay(100);
+            await Task.Delay(50);
         }
     }
 
+    // Broadcast message to all clients
     static async Task BroadcastMessageAsync(string message)
     {
         var bytes = Encoding.UTF8.GetBytes(message);
@@ -222,129 +1029,371 @@ class Program
             {
                 try
                 {
-                    await client.SendAsync(
-                        new ArraySegment<byte>(bytes),
-                        WebSocketMessageType.Text,
-                        true,
-                        CancellationToken.None
-                    );
-                    Console.WriteLine($"Broadcasted: {message}");
+                    await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error broadcasting to client: {ex.Message}");
-                    clients.Remove(client);
-                }
+                catch { clients.Remove(client); }
             }
         }
     }
 
-    // NEW: Broadcast only to clients (not to EGM)
-    static async Task BroadcastToClientsOnlyAsync(string message)
+    // Broadcast message to all clients EXCEPT the sender
+    static async Task BroadcastToOthersAsync(string message, WebSocket sender, string eventType = "")
     {
         var bytes = Encoding.UTF8.GetBytes(message);
         var currentClients = new List<WebSocket>(clients);
+        int sentCount = 0;
+        int failedCount = 0;
 
         foreach (var client in currentClients)
         {
-            if (client.State == WebSocketState.Open)
+            // Skip the sender
+            if (client != sender && client.State == WebSocketState.Open)
             {
                 try
                 {
-                    await client.SendAsync(
-                        new ArraySegment<byte>(bytes),
-                        WebSocketMessageType.Text,
-                        true,
-                        CancellationToken.None
-                    );
-                    Console.WriteLine($"Sent to client: {message}");
+                    await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+                    sentCount++;
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error sending to client: {ex.Message}");
+                catch 
+                { 
                     clients.Remove(client);
+                    failedCount++;
                 }
             }
         }
+
+        // Enhanced logging
+        if (!string.IsNullOrEmpty(eventType))
+        {
+            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║  ✓ EVENT SENT TO ROULETTE CLIENT(S)                          ║");
+            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+            Console.WriteLine($"║  Event Type: {eventType.PadRight(47)}║");
+            Console.WriteLine($"║  Sent To:    {sentCount} Roulette client(s){"".PadRight(35)}║");
+            Console.WriteLine($"║  Timestamp:  {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC{"".PadRight(25)}║");
+            if (failedCount > 0)
+            {
+                Console.WriteLine($"║  ⚠ WARNING:  Failed to send to {failedCount} client(s){"".PadRight(30)}║");
+            }
+            if (sentCount == 0)
+            {
+                Console.WriteLine($"║  ⚠ WARNING:  No clients received! (Total: {currentClients.Count}){"".PadRight(26)}║");
+            }
+            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+        }
+        else
+        {
+            Console.WriteLine($"[SEND] Message sent to {sentCount} client(s)");
+        }
     }
 
-    // NEW: Method to send AFT confirmation specifically to EGM
-    public static async Task SendAFTConfirmationToEGMAsync(bool confirmed, string transferId = "")
+    // NEW: Broadcast only to clients (not to EGM) - Simplified to broadcast all for now as filtering requires client ID mapping
+    static async Task BroadcastToClientsOnlyAsync(string message)
     {
-        var aftConfirmation = new AFTConfirmationMessage
+        await BroadcastMessageAsync(message);
+    }
+
+    public static async Task SendAFTConfirmationToEGMAsync(bool confirmed, string transferId = "", WebSocket sender = null)
+    {
+        var aftConfirmation = new
         {
             EventType = "AFT_CONFIRMED",
             Confirmed = confirmed,
             TransferId = transferId,
             Timestamp = DateTime.UtcNow
         };
-
         var jsonMessage = JsonSerializer.Serialize(aftConfirmation);
-        
-        // In a real implementation, you would need to identify which connection is the EGM
-        // For now, we'll broadcast to all connections (including EGM)
-        await BroadcastMessageAsync(jsonMessage);
-        Console.WriteLine($"Sent AFT confirmation to EGM: {jsonMessage}");
+        // Send to EGM client only (Roulette sent the confirmation)
+        await BroadcastToEGMClientsAsync(jsonMessage, sender, "AFT_CONFIRMED");
     }
 
-    // Helper method to send spin completion messages (can be called from EGM)
-    public static async Task SendSpinCompletedAsync(int betAmount, int winAmount, decimal currentCredits, string status = "SUCCESS")
+    // Send session_initialized event when EGM connects
+    static async Task SendSessionInitializedAsync(WebSocket egmSender, decimal availableCredits = 0)
     {
-        var spinCompleted = new SpinCompletedMessage
+        if (_sessionInitialized)
         {
-            EventType = "SPIN_COMPLETED",
-            BetAmount = betAmount,
-            WinAmount = winAmount,
-            CurrentCredits = currentCredits,
-            Timestamp = DateTime.UtcNow,
-            Status = status
+            Console.WriteLine($"[SESSION] Session already initialized, skipping");
+            return;
+        }
+
+        string egmId = "EGM-0441"; // Default, can be extracted from EGM if available
+        long sequence = Interlocked.Increment(ref _sequenceCounter);
+
+        var sessionEvent = new
+        {
+            @event = "session_initialized",
+            egmId = egmId,
+            sequence = sequence,
+            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+            nonce = Guid.NewGuid().ToString(),
+            payload = new
+            {
+                egmId = egmId,
+                jurisdiction = "NV", // Default, can be configured
+                currency = "ZAR", // Match your currency
+                availableCredits = (int)availableCredits, // Credits from EGM if available
+                aftAccountId = "AFT-12345", // Default, can be extracted if available
+                playerClass = "VIP", // Default, can be configured
+                version = new
+                {
+                    egmBackend = "1.0.0",
+                    sasDaemon = "2.1.0"
+                }
+            }
         };
 
-        var jsonMessage = JsonSerializer.Serialize(spinCompleted);
-        await BroadcastMessageAsync(jsonMessage);
+        string json = JsonSerializer.Serialize(sessionEvent);
+        Console.WriteLine($"[SESSION] Sending session_initialized to Roulette clients");
+        Console.WriteLine($"[SESSION]   EGM ID: {egmId}, Sequence: {sequence}");
+        
+                        // Send to all Roulette clients (exclude EGM sender)
+                        await BroadcastToRouletteClientsAsync(json, egmSender, "session_initialized");
+        _sessionInitialized = true;
+    }
+
+    // Broadcast message only to Roulette clients
+    static async Task BroadcastToRouletteClientsAsync(string message, WebSocket excludeSender, string eventType = "")
+    {
+        var bytes = Encoding.UTF8.GetBytes(message);
+        var currentClients = new List<WebSocket>(clients);
+        int sentCount = 0;
+        int failedCount = 0;
+
+        foreach (var client in currentClients)
+        {
+            // Skip the sender (EGM)
+            if (client != excludeSender && client.State == WebSocketState.Open)
+            {
+                // Only send to Roulette clients or unknown clients (might be Roulette connecting first)
+                if (!clientTypes.ContainsKey(client) || (clientTypes.TryGetValue(client, out var clientType) && clientType == "ROULETTE"))
+                {
+                    try
+                    {
+                        await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+                        sentCount++;
+                    }
+                    catch
+                    {
+                        clients.Remove(client);
+                        clientTypes.TryRemove(client, out _);
+                        failedCount++;
+                    }
+                }
+            }
+        }
+
+        // Enhanced logging
+        if (!string.IsNullOrEmpty(eventType))
+        {
+            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║  ✓ EVENT SENT TO ROULETTE CLIENT(S)                          ║");
+            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+            Console.WriteLine($"║  Event Type: {eventType.PadRight(47)}║");
+            Console.WriteLine($"║  Sent To:    {sentCount} Roulette client(s){"".PadRight(35)}║");
+            Console.WriteLine($"║  Timestamp:  {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC{"".PadRight(25)}║");
+            if (failedCount > 0)
+            {
+                Console.WriteLine($"║  ⚠ WARNING:  Failed to send to {failedCount} client(s){"".PadRight(30)}║");
+            }
+            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+        }
+        else
+        {
+            Console.WriteLine($"[ROULETTE] Message sent to {sentCount} Roulette client(s)");
+            if (failedCount > 0)
+            {
+                Console.WriteLine($"[WARNING] Failed to send to {failedCount} client(s)");
+            }
+        }
+    }
+
+    // Broadcast message only to EGM clients
+    static async Task BroadcastToEGMClientsAsync(string message, WebSocket excludeSender, string eventType = "")
+    {
+        var bytes = Encoding.UTF8.GetBytes(message);
+        var currentClients = new List<WebSocket>(clients);
+        int sentCount = 0;
+        int failedCount = 0;
+
+        foreach (var client in currentClients)
+        {
+            // Skip the sender (Roulette)
+            if (client != excludeSender && client.State == WebSocketState.Open)
+            {
+                // Only send to EGM clients
+                if (clientTypes.TryGetValue(client, out var clientType) && clientType == "EGM")
+                {
+                    try
+                    {
+                        await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+                        sentCount++;
+                    }
+                    catch
+                    {
+                        clients.Remove(client);
+                        clientTypes.TryRemove(client, out _);
+                        failedCount++;
+                    }
+                }
+            }
+        }
+
+        // Enhanced logging
+        if (!string.IsNullOrEmpty(eventType))
+        {
+            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+            Console.WriteLine($"║  ✓ EVENT SENT TO EGM CLIENT(S)                               ║");
+            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+            Console.WriteLine($"║  Event Type: {eventType.PadRight(47)}║");
+            Console.WriteLine($"║  Sent To:    {sentCount} EGM client(s){"".PadRight(37)}║");
+            Console.WriteLine($"║  Timestamp:  {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC{"".PadRight(25)}║");
+            if (failedCount > 0)
+            {
+                Console.WriteLine($"║  ⚠ WARNING:  Failed to send to {failedCount} client(s){"".PadRight(30)}║");
+            }
+            if (sentCount == 0)
+            {
+                Console.WriteLine($"║  ⚠ WARNING:  No EGM client received! (Total: {currentClients.Count}){"".PadRight(22)}║");
+            }
+            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+        }
+        else
+        {
+            Console.WriteLine($"[EGM] Message sent to {sentCount} EGM client(s)");
+            if (failedCount > 0)
+            {
+                Console.WriteLine($"[WARNING] Failed to send to {failedCount} client(s)");
+            }
+        }
+    }
+
+    // Send balance_snapshot event when EGM sends credit updates
+    static async Task SendBalanceSnapshotAsync(WebSocket egmSender, decimal availableCredits, string egmId = "EGM-0441")
+    {
+        string roundId = $"round-{DateTime.UtcNow.Ticks}";
+        long sequence = Interlocked.Increment(ref _sequenceCounter);
+
+        var balanceSnapshot = new
+        {
+            @event = "balance_snapshot",
+            roundId = roundId,
+            egmId = egmId,
+            sequence = sequence,
+            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+            nonce = Guid.NewGuid().ToString(),
+            payload = new
+            {
+                availableCredits = (int)availableCredits,
+                lockReason = (string)null // null if not locked
+            }
+        };
+
+        string json = JsonSerializer.Serialize(balanceSnapshot);
+        Console.WriteLine($"[BALANCE] Sending balance_snapshot: {availableCredits} credits");
+        Console.WriteLine($"[BALANCE]   RoundId: {roundId}, EGM ID: {egmId}, Sequence: {sequence}");
+        
+        // Send to all Roulette clients (exclude EGM sender)
+        await BroadcastToRouletteClientsAsync(json, egmSender, "balance_snapshot");
+    }
+
+    // Send bet_commit_ack event after receiving bet_commit from Roulette
+    static async Task SendBetCommitAckAsync(WebSocket rouletteSender, string roundId, string egmId, int totalStake)
+    {
+        long sequence = Interlocked.Increment(ref _sequenceCounter);
+        
+        // Calculate balance before and after bet
+        decimal egmBalanceBefore = _currentEgmBalance;
+        decimal egmBalanceAfter = _currentEgmBalance - totalStake;
+        
+        // Update tracked balance (will be confirmed when round_result comes)
+        // For now, we'll update it when we get GAME_UPDATE confirmation
+        
+        var betCommitAck = new
+        {
+            @event = "bet_commit_ack",
+            roundId = roundId,
+            egmId = egmId,
+            sequence = sequence,
+            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+            nonce = Guid.NewGuid().ToString(),
+            payload = new
+            {
+                roundId = roundId,
+                accepted = true,
+                reason = (string)null, // null if accepted
+                egmBalanceBefore = (int)egmBalanceBefore,
+                egmBalanceAfter = (int)egmBalanceAfter,
+                meters = new
+                {
+                    coinsIn = _coinsIn, // Tracked meter
+                    gamesPlayed = _gamesPlayed // Tracked meter
+                }
+            }
+        };
+
+        string json = JsonSerializer.Serialize(betCommitAck);
+        
+        // Send back to the Roulette client that sent bet_commit
+        await SendToClientAsync(json, rouletteSender, "bet_commit_ack", roundId, totalStake, egmBalanceBefore, egmBalanceAfter);
+    }
+
+    // Send message to a specific client
+    static async Task SendToClientAsync(string message, WebSocket client, string eventType = "", string roundId = "", int stake = 0, decimal balanceBefore = 0, decimal balanceAfter = 0)
+    {
+        if (client == null || client.State != WebSocketState.Open)
+        {
+            Console.WriteLine($"[WARNING] Cannot send message to client - client is null or not open");
+            return;
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(message);
+        try
+        {
+            await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+            
+            // Enhanced logging for bet_commit_ack
+            if (!string.IsNullOrEmpty(eventType) && eventType == "bet_commit_ack")
+            {
+                Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+                Console.WriteLine($"║  ✓ EVENT SENT TO ROULETTE CLIENT(S)                          ║");
+                Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+                Console.WriteLine($"║  Event Type: {eventType.PadRight(47)}║");
+                Console.WriteLine($"║  Sent To:    1 Roulette client{"".PadRight(38)}║");
+                Console.WriteLine($"║  RoundId:    {roundId.PadRight(47)}║");
+                Console.WriteLine($"║  Stake:      {stake} credits{"".PadRight(40)}║");
+                Console.WriteLine($"║  Balance:    {balanceBefore} → {balanceAfter} credits{"".PadRight(26)}║");
+                Console.WriteLine($"║  Timestamp:  {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC{"".PadRight(25)}║");
+                Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+            }
+            else if (!string.IsNullOrEmpty(eventType))
+            {
+                Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+                Console.WriteLine($"║  ✓ EVENT SENT TO ROULETTE CLIENT(S)                          ║");
+                Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+                Console.WriteLine($"║  Event Type: {eventType.PadRight(47)}║");
+                Console.WriteLine($"║  Sent To:    1 Roulette client{"".PadRight(38)}║");
+                Console.WriteLine($"║  Timestamp:  {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC{"".PadRight(25)}║");
+                Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+            }
+            else
+            {
+                Console.WriteLine($"[SEND] Message sent to client successfully");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERROR] Failed to send message to client: {ex.Message}");
+            clients.Remove(client);
+            clientTypes.TryRemove(client, out _);
+        }
     }
 }
 
-// Message models
-public class GameMessage
-{
-    public string EventType { get; set; }
-    public int BetAmount { get; set; }
-    public int WinAmount { get; set; }
-}
-
+// Minimal EGM Response Model required for serialization
 public class GameResponse
 {
     public string EventType { get; set; }
     public int BetAmount { get; set; }
     public int WinAmount { get; set; }
-    public DateTime Timestamp { get; set; }
-}
-
-// Model for spin completion messages
-public class SpinCompletedMessage
-{
-    public string EventType { get; set; }
-    public int BetAmount { get; set; }
-    public int WinAmount { get; set; }
-    public decimal CurrentCredits { get; set; }
-    public DateTime Timestamp { get; set; }
-    public string Status { get; set; }
-}
-
-// Model for credit updates
-public class CreditUpdateMessage
-{
-    public string EventType { get; set; } = "CREDIT_UPDATE";
-    public decimal CurrentCredits { get; set; }
-    public DateTime Timestamp { get; set; }
-}
-
-// Model for AFT confirmation messages
-public class AFTConfirmationMessage
-{
-    public string EventType { get; set; } = "AFT_CONFIRMED";
-    public bool Confirmed { get; set; }
-    public string TransferId { get; set; }
     public DateTime Timestamp { get; set; }
 }
