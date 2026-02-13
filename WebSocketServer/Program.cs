@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -195,6 +195,8 @@ class Program
                             Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
                             Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
                             Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+                            // Send session_initialized to this Roulette client so they get current EGM credits (even when connecting after EGM)
+                            await SendSessionInitializedToRouletteClientAsync(sender);
                         }
                         // Check for EGM-specific events (definitive EGM events) - only if not already Roulette
                         else if (needsIdentification && (eventType == "BILL_INSERTED" || 
@@ -213,14 +215,17 @@ class Program
                             Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
                             Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
                             
-                            // Extract available credits if present in the message
+                            // Extract available credits from CONNECTION_TEST / EGM message (CurrentCredits or payload.availableCredits)
                             decimal availableCredits = 0;
                             if (root.TryGetProperty("CurrentCredits", out var credits))
                                 availableCredits = credits.GetDecimal();
+                            else if (root.TryGetProperty("currentCredits", out var creditsCamel))
+                                availableCredits = creditsCamel.GetDecimal();
                             else if (root.TryGetProperty("payload", out var payload2) && payload2.TryGetProperty("availableCredits", out var availCredits))
                                 availableCredits = availCredits.GetDecimal();
                             
-                            // Send session_initialized to Roulette client when EGM connects
+                            _currentEgmBalance = availableCredits; // So late-joining Roulette clients get correct credits
+                            // Send session_initialized to Roulette with current credits so the game receives it
                             await SendSessionInitializedAsync(sender, availableCredits);
                         }
                         // Handle session_initialized - check context to determine client type
@@ -242,6 +247,7 @@ class Program
                                 if (root.TryGetProperty("payload", out var payload3) && payload3.TryGetProperty("availableCredits", out var availCredits2))
                                     availableCredits = availCredits2.GetDecimal();
                                 
+                                _currentEgmBalance = availableCredits; // So late-joining Roulette clients get correct credits
                                 await SendSessionInitializedAsync(sender, availableCredits);
                             }
                             // Otherwise, wait for more definitive events (don't identify yet)
@@ -1143,12 +1149,57 @@ class Program
         };
 
         string json = JsonSerializer.Serialize(sessionEvent);
-        Console.WriteLine($"[SESSION] Sending session_initialized to Roulette clients");
+        Console.WriteLine($"[SESSION] Sending session_initialized to Roulette clients (availableCredits: {availableCredits})");
         Console.WriteLine($"[SESSION]   EGM ID: {egmId}, Sequence: {sequence}");
         
                         // Send to all Roulette clients (exclude EGM sender)
                         await BroadcastToRouletteClientsAsync(json, egmSender, "session_initialized");
         _sessionInitialized = true;
+    }
+
+    // Send session_initialized to a single Roulette client (when they connect after EGM, so they get current credits)
+    static async Task SendSessionInitializedToRouletteClientAsync(WebSocket rouletteClient)
+    {
+        if (rouletteClient?.State != WebSocketState.Open) return;
+
+        decimal availableCredits = _currentEgmBalance;
+        string egmId = "EGM-0441";
+        long sequence = Interlocked.Increment(ref _sequenceCounter);
+
+        var sessionEvent = new
+        {
+            @event = "session_initialized",
+            egmId = egmId,
+            sequence = sequence,
+            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+            nonce = Guid.NewGuid().ToString(),
+            payload = new
+            {
+                egmId = egmId,
+                jurisdiction = "NV",
+                currency = "ZAR",
+                availableCredits = (int)availableCredits,
+                aftAccountId = "AFT-12345",
+                playerClass = "VIP",
+                version = new
+                {
+                    egmBackend = "1.0.0",
+                    sasDaemon = "2.1.0"
+                }
+            }
+        };
+
+        string json = JsonSerializer.Serialize(sessionEvent);
+        Console.WriteLine($"[SESSION] Sending session_initialized to late-joined Roulette client (availableCredits: {availableCredits})");
+        try
+        {
+            var bytes = Encoding.UTF8.GetBytes(json);
+            await rouletteClient.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SESSION] Failed to send session_initialized to Roulette client: {ex.Message}");
+        }
     }
 
     // Broadcast message only to Roulette clients
