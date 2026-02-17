@@ -34,6 +34,9 @@ class Program
     static async Task Main(string[] args)
     {
         Console.WriteLine("Starting Adapter WebSocket Server on ws://0.0.0.0:5000/ws...");
+        var desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+        Console.WriteLine($"WebSocket log file: {Path.Combine(desktop, "ws", "websocket.txt")}");
+        WebSocketFileLogger.LogInfo("=== WebSocket Adapter Server started ===");
 
         var builder = WebApplication.CreateBuilder(args);
         builder.WebHost.UseUrls("http://localhost:5000");
@@ -90,6 +93,7 @@ class Program
             Console.WriteLine($"║  ⚠ WARNING: More than 2 clients connected!{"".PadRight(20)}║");
         }
         Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+        WebSocketFileLogger.LogInfo($"CLIENT CONNECTED | Total: {clients.Count} | EGM: {egmCount} | Roulette: {rouletteCount} | Unknown: {unknownCount}");
 
         try
         {
@@ -103,6 +107,7 @@ class Program
                     // Get client type for logging
                     string clientType = clientTypes.TryGetValue(webSocket, out var type) ? type : "UNKNOWN";
                     Console.WriteLine($"[RECEIVED] From {clientType}: {message}");
+                    WebSocketFileLogger.LogReceived(clientType, message);
                     messageQueue.Enqueue((message, webSocket));
                 }
                 else if (result.MessageType == WebSocketMessageType.Close)
@@ -121,6 +126,9 @@ class Program
             string disconnectedType = clientTypes.TryGetValue(webSocket, out var dt) ? dt : "UNKNOWN";
             clients.Remove(webSocket);
             clientTypes.TryRemove(webSocket, out _);
+            // When EGM disconnects, allow session_initialized again when EGM reconnects
+            if (disconnectedType == "EGM")
+                _sessionInitialized = false;
             
             egmCount = clientTypes.Values.Count(v => v == "EGM");
             rouletteCount = clientTypes.Values.Count(v => v == "ROULETTE");
@@ -133,7 +141,8 @@ class Program
             Console.WriteLine($"║  EGM Clients:       {egmCount}{"".PadRight(45)}║");
             Console.WriteLine($"║  Roulette Clients:  {rouletteCount}{"".PadRight(45)}║");
             Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
-            
+            WebSocketFileLogger.LogInfo($"CLIENT DISCONNECTED | Type: {disconnectedType} | Remaining: {clients.Count}");
+
             if (webSocket.State != WebSocketState.Closed)
                 await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
         }
@@ -195,8 +204,9 @@ class Program
                             Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
                             Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
                             Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
-                            // Send session_initialized to this Roulette client so they get current EGM credits (even when connecting after EGM)
-                            await SendSessionInitializedToRouletteClientAsync(sender);
+                            // If EGM already sent session_initialized, send current balance to this Roulette so the URL shows it when it loads
+                            if (_sessionInitialized)
+                                await SendSessionInitializedToRouletteClientAsync(sender);
                         }
                         // Check for EGM-specific events (definitive EGM events) - only if not already Roulette
                         else if (needsIdentification && (eventType == "BILL_INSERTED" || 
@@ -204,8 +214,7 @@ class Program
                                 eventType == "AFT_CASHOUT" || 
                                 eventType == "SPIN_COMPLETED" || 
                                 eventType == "ui_ping" || 
-                                eventType == "UI_PING" ||
-                                eventType == "CONNECTION_TEST"))
+                                eventType == "UI_PING"))
                         {
                             clientTypes[sender] = "EGM";
                             Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
@@ -217,42 +226,47 @@ class Program
                             
                             // Extract available credits from CONNECTION_TEST / EGM message (CurrentCredits or payload.availableCredits)
                             decimal availableCredits = 0;
+                            bool messageHasCredits = false;
                             if (root.TryGetProperty("CurrentCredits", out var credits))
-                                availableCredits = credits.GetDecimal();
+                            { availableCredits = credits.GetDecimal(); messageHasCredits = true; }
                             else if (root.TryGetProperty("currentCredits", out var creditsCamel))
-                                availableCredits = creditsCamel.GetDecimal();
+                            { availableCredits = creditsCamel.GetDecimal(); messageHasCredits = true; }
                             else if (root.TryGetProperty("payload", out var payload2) && payload2.TryGetProperty("availableCredits", out var availCredits))
-                                availableCredits = availCredits.GetDecimal();
-                            
-                            _currentEgmBalance = availableCredits; // So late-joining Roulette clients get correct credits
-                            // Send session_initialized to Roulette with current credits so the game receives it
-                            await SendSessionInitializedAsync(sender, availableCredits);
+                            { availableCredits = availCredits.GetDecimal(); messageHasCredits = true; }
+                            // Only update tracked balance when message actually carries credits (don't overwrite with 0 on ui_ping/SPIN_COMPLETED)
+                            if (messageHasCredits)
+                                _currentEgmBalance = availableCredits;
+                            // Do NOT send session_initialized here — only when EGM sends session_initialized (once at startup)
                         }
-                        // Handle session_initialized - check context to determine client type
-                        else if (needsIdentification && eventType == "session_initialized")
+                        // Handle session_initialized from EGM - identify as EGM when client is EGM_Application (forward to Roulette handled below)
+                        else if (needsIdentification && eventType == "session_initialized" &&
+                                 root.TryGetProperty("client", out var clientField) && clientField.GetString() == "EGM_Application")
                         {
-                            // Check if it has "client" field indicating EGM
-                            if (root.TryGetProperty("client", out var clientField) && clientField.GetString() == "EGM_Application")
-                            {
-                                clientTypes[sender] = "EGM";
-                                Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
-                                Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: EGM                                      ║");
-                                Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
-                                Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
-                                Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
-                                Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
-                                
-                                // Extract available credits
-                                decimal availableCredits = 0;
-                                if (root.TryGetProperty("payload", out var payload3) && payload3.TryGetProperty("availableCredits", out var availCredits2))
-                                    availableCredits = availCredits2.GetDecimal();
-                                
-                                _currentEgmBalance = availableCredits; // So late-joining Roulette clients get correct credits
-                                await SendSessionInitializedAsync(sender, availableCredits);
-                            }
-                            // Otherwise, wait for more definitive events (don't identify yet)
-                            // Roulette clients will send round_state/bet_commit next, EGM will send ui_ping
+                            clientTypes[sender] = "EGM";
+                            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
+                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: EGM                                      ║");
+                            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
+                            Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
+                            Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
+                            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
                         }
+                        // Roulette sending session_initialized without client EGM_Application: wait for round_state/bet_commit etc.
+                    }
+
+                    // Only when EGM is connected and sends session_initialized (once at startup) — never during gameplay or from Roulette
+                    bool senderIsEgm = clientTypes.TryGetValue(sender, out var senderRole) && senderRole == "EGM";
+                    bool senderUnknown = !clientTypes.ContainsKey(sender);
+                    if (eventType == "session_initialized" &&
+                        root.TryGetProperty("client", out var clientCheck) && clientCheck.GetString() == "EGM_Application" &&
+                        (senderIsEgm || senderUnknown)) // only from EGM socket, never from Roulette
+                    {
+                        decimal availableCredits = 0;
+                        if (root.TryGetProperty("payload", out var payloadEgm) && payloadEgm.TryGetProperty("availableCredits", out var ac))
+                        {
+                            availableCredits = ac.GetDecimal();
+                            _currentEgmBalance = availableCredits;
+                        }
+                        await SendSessionInitializedAsync(sender, availableCredits);
                     }
 
                     // =======================================================================
@@ -398,8 +412,8 @@ class Program
                         string roundId = $"round-{DateTime.UtcNow.Ticks}";
                         long sequence = Interlocked.Increment(ref _sequenceCounter);
                         
-                        // Update tracked EGM balance (set to 0 after cashout)
-                        _currentEgmBalance = 0;
+                        // Only store current credits from EGM (they send 0 on cashout)
+                        _currentEgmBalance = currentCredits;
                         
                         Console.WriteLine($"[TRANSLATE] EGM -> Roulette: AFT_CASHOUT received");
                         Console.WriteLine($"[TRANSLATE]   Amount: {amount}, Current Credits: {currentCredits}, Balance Before: {egmBalanceBefore}");
@@ -675,8 +689,7 @@ class Program
                             string eventJson = JsonSerializer.Serialize(gameUpdateEvent);
                             await BroadcastToEGMClientsAsync(eventJson, sender, "GAME_UPDATE");
 
-                            // Update EGM balance: subtract bet, add win
-                            _currentEgmBalance = _currentEgmBalance - _pendingBetStake + winAmount;
+                            // Do not update _currentEgmBalance here — only EGM provides current credits (e.g. SPIN_COMPLETED)
                             _gamesPlayed++; // Increment games played meter
 
                             // Reset State
@@ -942,11 +955,24 @@ class Program
                     //  3. EXISTING LOGIC (Pass-throughs)
                     // =======================================================================
 
-                    // Pass-through SPIN_COMPLETED so UI knows animation finished
+                    // Pass-through SPIN_COMPLETED; update and push credits only from EGM
                     else if (eventType == "SPIN_COMPLETED")
                     {
+                        bool hasCredits = root.TryGetProperty("CurrentCredits", out var spinCredits);
+                        if (hasCredits)
+                            _currentEgmBalance = spinCredits.GetDecimal();
+                        else if (root.TryGetProperty("currentCredits", out var spinCreditsCamel))
+                        {
+                            _currentEgmBalance = spinCreditsCamel.GetDecimal();
+                            hasCredits = true;
+                        }
+                        if (hasCredits)
+                        {
+                            string egmId = "EGM-0441";
+                            if (root.TryGetProperty("EgmId", out var eid)) egmId = eid.GetString();
+                            await SendBalanceSnapshotAsync(sender, _currentEgmBalance, egmId);
+                        }
                         Console.WriteLine($"[FORWARD] Passing through SPIN_COMPLETED");
-                        // Forward to Roulette client (SPIN_COMPLETED comes from EGM)
                         await BroadcastToRouletteClientsAsync(message, sender, "SPIN_COMPLETED");
                     }
                     // Handle cashout - Store only, do not forward to EGM
@@ -1157,7 +1183,7 @@ class Program
         _sessionInitialized = true;
     }
 
-    // Send session_initialized to a single Roulette client (when they connect after EGM, so they get current credits)
+    // Send session_initialized to one Roulette client when they connect after EGM (so the URL gets current balance)
     static async Task SendSessionInitializedToRouletteClientAsync(WebSocket rouletteClient)
     {
         if (rouletteClient?.State != WebSocketState.Open) return;
@@ -1181,16 +1207,13 @@ class Program
                 availableCredits = (int)availableCredits,
                 aftAccountId = "AFT-12345",
                 playerClass = "VIP",
-                version = new
-                {
-                    egmBackend = "1.0.0",
-                    sasDaemon = "2.1.0"
-                }
+                version = new { egmBackend = "1.0.0", sasDaemon = "2.1.0" }
             }
         };
 
         string json = JsonSerializer.Serialize(sessionEvent);
-        Console.WriteLine($"[SESSION] Sending session_initialized to late-joined Roulette client (availableCredits: {availableCredits})");
+        Console.WriteLine($"[SESSION] Sending session_initialized to Roulette (URL loaded) (availableCredits: {availableCredits})");
+        WebSocketFileLogger.LogSent("ROULETTE", "session_initialized", json);
         try
         {
             var bytes = Encoding.UTF8.GetBytes(json);
@@ -1198,13 +1221,14 @@ class Program
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SESSION] Failed to send session_initialized to Roulette client: {ex.Message}");
+            Console.WriteLine($"[SESSION] Failed to send session_initialized to Roulette: {ex.Message}");
         }
     }
 
     // Broadcast message only to Roulette clients
     static async Task BroadcastToRouletteClientsAsync(string message, WebSocket excludeSender, string eventType = "")
     {
+        WebSocketFileLogger.LogSent("ROULETTE", eventType, message);
         var bytes = Encoding.UTF8.GetBytes(message);
         var currentClients = new List<WebSocket>(clients);
         int sentCount = 0;
@@ -1261,6 +1285,7 @@ class Program
     // Broadcast message only to EGM clients
     static async Task BroadcastToEGMClientsAsync(string message, WebSocket excludeSender, string eventType = "")
     {
+        WebSocketFileLogger.LogSent("EGM", eventType, message);
         var bytes = Encoding.UTF8.GetBytes(message);
         var currentClients = new List<WebSocket>(clients);
         int sentCount = 0;
@@ -1352,13 +1377,10 @@ class Program
     {
         long sequence = Interlocked.Increment(ref _sequenceCounter);
         
-        // Calculate balance before and after bet
+        // Balance from EGM only; ack uses current value and reserved amount for Roulette
         decimal egmBalanceBefore = _currentEgmBalance;
         decimal egmBalanceAfter = _currentEgmBalance - totalStake;
-        
-        // Update tracked balance (will be confirmed when round_result comes)
-        // For now, we'll update it when we get GAME_UPDATE confirmation
-        
+
         var betCommitAck = new
         {
             @event = "bet_commit_ack",

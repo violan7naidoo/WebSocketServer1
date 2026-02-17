@@ -59,14 +59,14 @@ Event names are read from `EventType`, `eventType`, or `event` in the JSON root.
 | `AFT_CASHOUT`     | User cashed out; EGM sends amount, optional bet/win, balance goes to 0. |
 | `ui_ping` / `UI_PING` | Keep-alive / sync; can also identify EGM on first message. |
 | `SPIN_COMPLETED`  | EGM reports spin animation finished; forwarded to Roulette. |
-| `CONNECTION_TEST` | Connection check; identifies EGM. May include `CurrentCredits`; server forwards it to Roulette in `session_initialized.payload.availableCredits`. |
-| `session_initialized` | Optional: EGM sends with `client: "EGM_Application"` and optional `payload.availableCredits` to identify and send initial credits. |
+| `CONNECTION_TEST` | Not used by EGM; EGM identifies via **session_initialized** only. |
+| `session_initialized` | EGM sends once at startup with `client: "EGM_Application"` and `payload.availableCredits`. Server forwards it to Roulette once (this is the only trigger for sending session_initialized to Roulette from EGM). |
 
 ### 3.2 Server → Roulette (outbound)
 
 | Event                 | When sent | Purpose |
 |-----------------------|-----------|--------|
-| `session_initialized` | Once when EGM is first identified | Session start; includes `payload.availableCredits` (and egmId, jurisdiction, currency, etc.). |
+| `session_initialized` | Only when EGM sends `session_initialized` once at startup (with `client: "EGM_Application"`). Never sent when Roulette connects/reconnects. | Session start; includes `payload.availableCredits` from EGM (and egmId, jurisdiction, currency, etc.). |
 | `cash_event`          | After `BILL_INSERTED` | Cash-in translated to Roulette format (`type: "bv_stack"`, denomination, meters, etc.). |
 | `aft_transfer`        | After `AFT_DEPOSIT`   | AFT deposit (amount, authCode, remainingBalance, etc.). |
 | `balance_snapshot`    | After `BILL_INSERTED`, `AFT_DEPOSIT`, or `AFT_CASHOUT` | Current credits for Roulette (`payload.availableCredits`; 0 after cashout). |
@@ -119,7 +119,7 @@ All Roulette events are **stored** for audit/log; only **round_result** drives t
 5. Roulette updates balance and allows betting.
 
 **Startup / first credits**  
-- When the EGM is first identified (e.g. by `BILL_INSERTED`, `AFT_DEPOSIT`, `ui_ping`, or `session_initialized` with `client: "EGM_Application"`), the server sends **session_initialized** to Roulette with `payload.availableCredits` (from `CurrentCredits` or `payload.availableCredits` in the EGM message, or 0).  
+- When the EGM sends **session_initialized** (once at startup, with `client: "EGM_Application"` and `payload.availableCredits`), the server forwards it to Roulette. This is the only way the server sends session_initialized to Roulette for EGM startup; CONNECTION_TEST is not used for that.  
 - So “credits to the game” at startup and after each cash/credit event are delivered via **session_initialized** (once) and **balance_snapshot** (after each credit change).
 
 ---
@@ -156,7 +156,7 @@ So: **user puts money in** (EGM → BILL_INSERTED/AFT_DEPOSIT → server → cas
 ## 5. Server State (relevant to flow)
 
 - **Client type per socket:** EGM or ROULETTE (from first message).  
-- **Session:** `_sessionInitialized` — session_initialized is sent once when EGM is identified.  
+- **Session:** `_sessionInitialized` — session_initialized is sent to Roulette once when EGM sends session_initialized (with `client: "EGM_Application"`).  
 - **Round:** `_pendingBetStake`, `_isRoundActive` — set on bet_commit, cleared when round_result is processed and GAME_UPDATE is sent.  
 - **Balance/meters:** `_currentEgmBalance`, `_coinsIn`, `_gamesPlayed` — updated on BILL_INSERTED, AFT_DEPOSIT, AFT_CASHOUT, and on round_result (balance = balance - stake + win).  
 
