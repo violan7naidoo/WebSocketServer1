@@ -56,64 +56,64 @@ class Program
         {
             if (context.Request.Path == "/ws/roulette")
             {
-                ClientType = "roulette";
                 if (context.WebSockets.IsWebSocketRequest)
                 {
-                    using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-                    await HandleWebSocketAsync(webSocket, ClientType);
+                    using var ws = await context.WebSockets.AcceptWebSocketAsync();
+                    await HandleWebSocketAsync(ws, "roulette"); // ✅ correct
+                    return;
                 }
-                else
-                {
-                    context.Response.StatusCode = 400;
-                }
+                context.Response.StatusCode = 400;
+                return;
             }
-            else
-                if (context.Request.Path == "/ws/egm")
+
+            if (context.Request.Path == "/ws/egm")
             {
-                ClientType = "roulette";
                 if (context.WebSockets.IsWebSocketRequest)
                 {
-                    using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-                    await HandleWebSocketAsync(webSocket, ClientType);
+                    using var ws = await context.WebSockets.AcceptWebSocketAsync();
+                    await HandleWebSocketAsync(ws, "egm"); // ✅ correct
+                    return;
                 }
-                else
-                {
-                    context.Response.StatusCode = 400;
-                }
+                context.Response.StatusCode = 400;
+                return;
             }
-            else
-            {
-                await next();
-            }
+
+            await next();
         });
 
         await app.RunAsync();
     }
 
-    static async Task HandleWebSocketAsync(WebSocket webSocket, String _ClientType)
+    static async Task HandleWebSocketAsync(WebSocket webSocket, string clientRoleFromPath)
     {
         var buffer = new byte[1024 * 4];
-        clients.Add(webSocket);
+
+        // ✅ Thread-safe add
+        lock (clients)
+            clients.Add(webSocket);
+
+        // ✅ IMPORTANT: Register role immediately from the URL path (/ws/egm or /ws/roulette)
+        // This prevents mis-routing and "sending to both".
+        clientTypes[webSocket] = clientRoleFromPath;
 
         // Connection validation and logging
-        int egmCount = 0;//clientTypes.Values.Count(v => v == "EGM");
-        int rouletteCount = 0;//clientTypes.Values.Count(v => v == "ROULETTE");
-        egmCount = clientTypes.Values.Count(v => v == "egm");
-        rouletteCount = clientTypes.Values.Count(v => v == "roulette");
+        int egmCount = clientTypes.Values.Count(v => string.Equals(v, "egm", StringComparison.OrdinalIgnoreCase));
+        int rouletteCount = clientTypes.Values.Count(v => string.Equals(v, "roulette", StringComparison.OrdinalIgnoreCase));
 
         Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
         Console.WriteLine($"║  🔌 CLIENT CONNECTED                                          ║");
         Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
-        Console.WriteLine($"║  Total Clients:    {clients.Count} (Expected: 2){"".PadRight(35)}║");
-        Console.WriteLine($"║  EGM Clients:      {egmCount}{"".PadRight(45)}║");
-        Console.WriteLine($"║  Roulette Clients: {rouletteCount}{"".PadRight(45)}║");
+        Console.WriteLine($"║  Role:           {clientRoleFromPath.PadRight(51)}║");
+        Console.WriteLine($"║  Total Clients:  {clients.Count} (Expected: 2){"".PadRight(35)}║");
+        Console.WriteLine($"║  EGM Clients:    {egmCount}{"".PadRight(45)}║");
+        Console.WriteLine($"║  Roulette Clients:{rouletteCount}{"".PadRight(44)}║");
 
         if (clients.Count > 2)
-        {
             Console.WriteLine($"║  ⚠ WARNING: More than 2 clients connected!{"".PadRight(20)}║");
-        }
+
         Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
-        WebSocketFileLogger.LogInfo($"CLIENT CONNECTED | Total: {clients.Count} | EGM: {egmCount} | Roulette: {rouletteCount}");
+
+        WebSocketFileLogger.LogInfo($"CLIENT CONNECTED | Role: {clientRoleFromPath} | Total: {clients.Count} | EGM: {egmCount} | Roulette: {rouletteCount}");
 
         try
         {
@@ -124,16 +124,19 @@ class Program
                 if (result.MessageType == WebSocketMessageType.Text)
                 {
                     var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    // Get client type for logging
-                    // string clientType = clientTypes.TryGetValue(webSocket, out var type) ? type : "UNKNOWN";
-                    // Send session_initialized to Roulette only once: when session is ready and we haven't sent to this client yet
-                    if ((_ClientType == "roulette") && _sessionInitialized &&
+
+                    // ✅ Send session_initialized to Roulette client once (if EGM already initialized session)
+                    if (string.Equals(clientRoleFromPath, "roulette", StringComparison.OrdinalIgnoreCase) &&
+                        _sessionInitialized &&
                         sessionSentToClients.TryAdd(webSocket, 0))
                     {
                         await SendSessionInitializedToRouletteClientAsync(webSocket);
                     }
-                    Console.WriteLine($"[RECEIVED] From {_ClientType}: {message}");
-                    WebSocketFileLogger.LogReceived(_ClientType, message);
+
+                    Console.WriteLine($"[RECEIVED] From {clientRoleFromPath}: {message}");
+                    WebSocketFileLogger.LogReceived(clientRoleFromPath, message);
+
+                    // Queue processing
                     messageQueue.Enqueue((message, webSocket));
                 }
                 else if (result.MessageType == WebSocketMessageType.Close)
@@ -149,34 +152,63 @@ class Program
         }
         finally
         {
+            // Read role before we remove it
             string disconnectedType = clientTypes.TryGetValue(webSocket, out var dt) ? dt : "UNKNOWN";
-            clients.Remove(webSocket);
+
+            // ✅ Thread-safe remove
+            lock (clients)
+                clients.Remove(webSocket);
+
             clientTypes.TryRemove(webSocket, out _);
-            sessionSentToClients.TryRemove(webSocket, out _); // allow session_initialized again if this client reconnects
-            // When EGM disconnects, allow session_initialized again when EGM reconnects
-            if (disconnectedType == "egm")
+            sessionSentToClients.TryRemove(webSocket, out _);
+
+            // ✅ If EGM disconnects, allow session re-init when it reconnects
+            if (string.Equals(disconnectedType, "egm", StringComparison.OrdinalIgnoreCase))
                 _sessionInitialized = false;
 
-            egmCount = clientTypes.Values.Count(v => v == "egm");
-            rouletteCount = clientTypes.Values.Count(v => v == "roulette");
+            egmCount = clientTypes.Values.Count(v => string.Equals(v, "egm", StringComparison.OrdinalIgnoreCase));
+            rouletteCount = clientTypes.Values.Count(v => string.Equals(v, "roulette", StringComparison.OrdinalIgnoreCase));
 
             Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
-            Console.WriteLine($"║  🔌 CLIENT DISCONNECTED                                      ║");
+            Console.WriteLine($"║  🔌 CLIENT DISCONNECTED                                       ║");
             Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
             Console.WriteLine($"║  Disconnected Type: {disconnectedType.PadRight(40)}║");
             Console.WriteLine($"║  Remaining Clients: {clients.Count}{"".PadRight(42)}║");
             Console.WriteLine($"║  EGM Clients:       {egmCount}{"".PadRight(45)}║");
             Console.WriteLine($"║  Roulette Clients:  {rouletteCount}{"".PadRight(45)}║");
             Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+
             WebSocketFileLogger.LogInfo($"CLIENT DISCONNECTED | Type: {disconnectedType} | Remaining: {clients.Count}");
 
             if (webSocket.State != WebSocketState.Closed)
-                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+            {
+                try
+                {
+                    await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                }
+                catch
+                {
+                    // ignore close failures
+                }
+            }
         }
     }
 
     static async Task ProcessMessageQueueAsync()
     {
+        // Optional: define these once (static readonly) outside the loop if you prefer.
+        // Keeping here for copy/paste clarity.
+        var rouletteDefinitiveEvents = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "bet_commit", "round_result", "round_state", "cash_event", "aft_transfer",
+        "AFT_CONFIRMED", "cashout", "round_summary", "refund", "round_void", "error", "ui_pong"
+    };
+
+        var egmDefinitiveEvents = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "BILL_INSERTED", "AFT_DEPOSIT", "AFT_CASHOUT", "SPIN_COMPLETED", "ui_ping", "UI_PING"
+    };
+
         while (true)
         {
             if (messageQueue.TryDequeue(out var item))
@@ -193,107 +225,101 @@ class Program
                     else if (root.TryGetProperty("eventType", out var et2)) eventType = et2.GetString();
                     else if (root.TryGetProperty("event", out var ev)) eventType = ev.GetString();
 
-                    // Identify client type based on first message
-                    // IMPORTANT: Check Roulette events FIRST to avoid misidentifying Roulette clients as EGM
-                    // Also allow re-identification if a client was misidentified
-                    bool needsIdentification = !clientTypes.ContainsKey(sender);
-                    bool needsReidentification = clientTypes.TryGetValue(sender, out var currentType) &&
-                                                 currentType == "egm" &&
-                                                 (eventType == "bet_commit" || eventType == "round_result" || eventType == "round_state" ||
-                                                  eventType == "cash_event" || eventType == "aft_transfer" || eventType == "AFT_CONFIRMED" ||
-                                                  eventType == "cashout" || eventType == "round_summary" || eventType == "refund" ||
-                                                  eventType == "round_void" || eventType == "error" || eventType == "ui_pong");
+                    // ============================================================
+                    // ✅ GUARD: Once identified at connect-time, DON'T re-identify
+                    // ============================================================
+                    bool alreadyKnown = clientTypes.TryGetValue(sender, out var knownType) &&
+                                        !string.IsNullOrWhiteSpace(knownType);
 
-                    if (needsIdentification || needsReidentification)
+                    // Optional: if connect-time type is wrong, correct ONLY on definitive evidence
+                    if (alreadyKnown)
                     {
-                        // Check for Roulette-specific events FIRST (these are definitive)
-                        if (eventType == "bet_commit" ||
-                            eventType == "round_result" ||
-                            eventType == "round_state" ||
-                            eventType == "cash_event" ||
-                            eventType == "aft_transfer" ||
-                            eventType == "AFT_CONFIRMED" ||
-                            eventType == "cashout" ||
-                            eventType == "round_summary" ||
-                            eventType == "refund" ||
-                            eventType == "round_void" ||
-                            eventType == "error" ||
-                            eventType == "ui_pong")
+                        // If socket is labeled "egm" but sends roulette-definitive events -> correct it
+                        if (string.Equals(knownType, "egm", StringComparison.OrdinalIgnoreCase) &&
+                            rouletteDefinitiveEvents.Contains(eventType))
                         {
-                            if (needsReidentification)
-                            {
-                                Console.WriteLine($"[RE-IDENTIFY] Client was misidentified as EGM, correcting to ROULETTE");
-                            }
+                            Console.WriteLine($"[ROLE MISMATCH] Socket marked as EGM but sent Roulette event '{eventType}'. Correcting to 'roulette'.");
+                            clientTypes[sender] = "roulette";
+                            knownType = "roulette";
+                        }
+                        // If socket is labeled "roulette" but sends egm-definitive events -> correct it
+                        else if (string.Equals(knownType, "roulette", StringComparison.OrdinalIgnoreCase) &&
+                                 egmDefinitiveEvents.Contains(eventType))
+                        {
+                            Console.WriteLine($"[ROLE MISMATCH] Socket marked as Roulette but sent EGM event '{eventType}'. Correcting to 'egm'.");
+                            clientTypes[sender] = "egm";
+                            knownType = "egm";
+                        }
+
+                        // IMPORTANT: skip the old "first message identification" logic completely
+                    }
+                    else
+                    {
+                        // ============================================================
+                        // Legacy identification for older connections (if any),
+                        // but only when we truly don't know yet.
+                        // ============================================================
+                        if (rouletteDefinitiveEvents.Contains(eventType))
+                        {
                             clientTypes[sender] = "roulette";
                             Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
-                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: ROULETTE                                  ║");
+                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: ROULETTE                                ║");
                             Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
                             Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
-                            Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
                             Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
-                            // If EGM already sent session_initialized, send current balance to this Roulette so the URL shows it when it loads
-
-
-
                         }
-                        // Check for EGM-specific events (definitive EGM events) - only if not already Roulette
-                        else if (needsIdentification && (eventType == "BILL_INSERTED" ||
-                                eventType == "AFT_DEPOSIT" ||
-                                eventType == "AFT_CASHOUT" ||
-                                eventType == "SPIN_COMPLETED" ||
-                                eventType == "ui_ping" ||
-                                eventType == "UI_PING"))
+                        else if (egmDefinitiveEvents.Contains(eventType))
                         {
                             clientTypes[sender] = "egm";
                             Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
-                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: EGM                                      ║");
+                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: EGM                                     ║");
                             Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
                             Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
-                            Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "EGM")}, Roulette: {clientTypes.Values.Count(v => v == "ROULETTE")}){"".PadRight(15)}║");
                             Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
 
-                            // Extract available credits from CONNECTION_TEST / EGM message (CurrentCredits or payload.availableCredits)
+                            // Extract credits only if present
                             decimal availableCredits = 0;
                             bool messageHasCredits = false;
+
                             if (root.TryGetProperty("CurrentCredits", out var credits))
                             { availableCredits = credits.GetDecimal(); messageHasCredits = true; }
                             else if (root.TryGetProperty("currentCredits", out var creditsCamel))
                             { availableCredits = creditsCamel.GetDecimal(); messageHasCredits = true; }
-                            else if (root.TryGetProperty("payload", out var payload2) && payload2.TryGetProperty("availableCredits", out var availCredits))
+                            else if (root.TryGetProperty("payload", out var payload2) &&
+                                     payload2.TryGetProperty("availableCredits", out var availCredits))
                             { availableCredits = availCredits.GetDecimal(); messageHasCredits = true; }
-                            // Only update tracked balance when message actually carries credits (don't overwrite with 0 on ui_ping/SPIN_COMPLETED)
+
                             if (messageHasCredits)
                                 _currentEgmBalance = availableCredits;
-                            // Do NOT send session_initialized here — only when EGM sends session_initialized (once at startup)
                         }
-                        // Handle session_initialized from EGM - identify as EGM when client is EGM_Application (forward to Roulette handled below)
-                        else if (needsIdentification && eventType == "session_initialized" &&
-                                 root.TryGetProperty("client", out var clientField) && clientField.GetString() == "EGM_Application")
+                        else if (eventType == "session_initialized" &&
+                                 root.TryGetProperty("client", out var clientField) &&
+                                 clientField.GetString() == "EGM_Application")
                         {
                             clientTypes[sender] = "egm";
-                            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
-                            Console.WriteLine($"║  ✓ CLIENT IDENTIFIED: EGM                                      ║");
-                            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
-                            Console.WriteLine($"║  First Event: {eventType.PadRight(46)}║");
-                            Console.WriteLine($"║  Total Clients: {clients.Count} (EGM: {clientTypes.Values.Count(v => v == "egm")}, Roulette: {clientTypes.Values.Count(v => v == "roulette")}){"".PadRight(15)}║");
-                            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
+                            Console.WriteLine($"[IDENTIFY] session_initialized from EGM_Application -> setting sender as EGM");
                         }
-                        // Roulette sending session_initialized without client EGM_Application: wait for round_state/bet_commit etc.
                     }
 
-                    // Only when EGM is connected and sends session_initialized (once at startup) — never during gameplay or from Roulette
-                    bool senderIsEgm = clientTypes.TryGetValue(sender, out var senderRole) && senderRole == "egm";
-                    bool senderUnknown = !clientTypes.ContainsKey(sender);
+                    // ============================================================
+                    // session_initialized handling (only from EGM socket)
+                    // ============================================================
+                    bool senderIsEgm = clientTypes.TryGetValue(sender, out var senderRole) &&
+                                       string.Equals(senderRole, "egm", StringComparison.OrdinalIgnoreCase);
+
                     if (eventType == "session_initialized" &&
-                        root.TryGetProperty("client", out var clientCheck) && clientCheck.GetString() == "EGM_Application" &&
-                        (senderIsEgm || senderUnknown)) // only from EGM socket, never from Roulette
+                        root.TryGetProperty("client", out var clientCheck) &&
+                        clientCheck.GetString() == "EGM_Application" &&
+                        senderIsEgm)
                     {
                         decimal availableCredits = 0;
-                        if (root.TryGetProperty("payload", out var payloadEgm) && payloadEgm.TryGetProperty("availableCredits", out var ac))
+                        if (root.TryGetProperty("payload", out var payloadEgm) &&
+                            payloadEgm.TryGetProperty("availableCredits", out var ac))
                         {
                             availableCredits = ac.GetDecimal();
                             _currentEgmBalance = availableCredits;
                         }
+
                         await SendSessionInitializedAsync(sender, availableCredits);
                     }
 
@@ -584,7 +610,8 @@ class Program
                             EventType = "NO_MORE_BETS",
                             Timestamp = DateTime.UtcNow,
                             RoundId = roundId,
-                            EgmId = egmId
+                            EgmId = egmId,
+                            BetValue = totalStake // Include bet amount for better correlation in logs and potential future use in EGM
                         };
                         string eventJson = JsonSerializer.Serialize(NO_MORE_BETS_Events);
                         await BroadcastToEGMClientsAsync(eventJson, sender, "NO_MORE_BETS");
@@ -737,6 +764,32 @@ class Program
                         {
                             //Console.WriteLine($"[WARNING] round_result received but no active round (_isRoundActive = false)");
                         }
+
+
+                        long sequence = Interlocked.Increment(ref _sequenceCounter);
+                        // Create cashout_ack event matching expected format
+                        var roundresultsAck = new
+                        {
+                            @event = "round_result_akn",
+                            roundId = roundId,
+                            egmId = egmId,
+                            sequence = sequence,
+                            sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                            nonce = Guid.NewGuid().ToString(),
+                            payload = new
+                            {
+                                roundId = roundId,
+                                accepted = true                               
+                            }
+                        };
+
+                        string json2 = JsonSerializer.Serialize(roundresultsAck);
+                        Console.WriteLine($"[TRANSLATE]   Converting to: round_result_akn");
+
+                        // Send to Roulette client only
+                        // ✅ Send ack back to the SAME roulette socket that sent round_result
+                        await SendToSocketAsync(sender, json2, "ROULETTE", "round_result_akn");
+
                     }
                     else if (eventType == "round_summary")
                     {
@@ -785,6 +838,8 @@ class Program
                         // Store round_summary message (do not forward to EGM)
                         storedRouletteMessages.Enqueue(("round_summary", message, DateTime.UtcNow));
                         Console.WriteLine($"[STORE]   Stored round_summary message (Total stored: {storedRouletteMessages.Count})");
+
+
                     }
                     else if (eventType == "refund")
                     {
@@ -1089,6 +1144,15 @@ class Program
         }
     }
 
+    static async Task SendToSocketAsync(WebSocket ws, string message, string who, string eventType)
+    {
+        if (ws == null || ws.State != WebSocketState.Open) return;
+
+        WebSocketFileLogger.LogSent(who, eventType, message);
+        var bytes = Encoding.UTF8.GetBytes(message);
+        await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+    }
+
     // Broadcast message to all clients
     static async Task BroadcastMessageAsync(string message)
     {
@@ -1270,98 +1334,85 @@ class Program
     {
         WebSocketFileLogger.LogSent("ROULETTE", eventType, message);
         var bytes = Encoding.UTF8.GetBytes(message);
-        var currentClients = new List<WebSocket>(clients);
-        int sentCount = 0;
-        int failedCount = 0;
+
+        List<WebSocket> currentClients;
+        lock (clients)
+            currentClients = new List<WebSocket>(clients);
+
+        int sentCount = 0, failedCount = 0;
 
         foreach (var client in currentClients)
         {
-            /*
-            // Skip the sender (EGM)
-            if (client != excludeSender && client.State == WebSocketState.Open)
-            {
-                // Only send to Roulette clients or unknown clients (might be Roulette connecting first)
-                if (!clientTypes.ContainsKey(client) || (clientTypes.TryGetValue(client, out var clientType) && clientType == "ROULETTE"))
-                {
-                    try
-                    {
-                        await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-                        sentCount++;
-                    }
-                    catch
-                    {
-                        clients.Remove(client);
-                        clientTypes.TryRemove(client, out _);
-                        failedCount++;
-                    }
-                }
-            }
-            */
+            if (client == null) continue;
+            if (client == excludeSender) continue;
+            if (client.State != WebSocketState.Open) continue;
+
+            // ✅ Only send to roulette clients
+            if (!clientTypes.TryGetValue(client, out var role) ||
+                !string.Equals(role, "roulette", StringComparison.OrdinalIgnoreCase))
+                continue;
+
             try
             {
                 await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
                 sentCount++;
             }
-            catch
+            catch (Exception ex)
             {
-
+                failedCount++;
+                lock (clients) clients.Remove(client);
+                clientTypes.TryRemove(client, out _);
+                Console.WriteLine($"[ROULETTE SEND ERROR] {eventType} -> removed client. Reason: {ex.Message}");
             }
         }
 
-        // Enhanced logging
-        if (!string.IsNullOrEmpty(eventType))
-        {
-            Console.WriteLine($"╔════════════════════════════════════════════════════════════════╗");
-            Console.WriteLine($"║  ✓ EVENT SENT TO ROULETTE CLIENT(S)                          ║");
-            Console.WriteLine($"╠════════════════════════════════════════════════════════════════╣");
-            Console.WriteLine($"║  Event Type: {eventType.PadRight(47)}║");
-            Console.WriteLine($"║  Sent To:    {sentCount} Roulette client(s){"".PadRight(35)}║");
-            Console.WriteLine($"║  Timestamp:  {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC{"".PadRight(25)}║");
-            if (failedCount > 0)
-            {
-                Console.WriteLine($"║  ⚠ WARNING:  Failed to send to {failedCount} client(s){"".PadRight(30)}║");
-            }
-            Console.WriteLine($"╚════════════════════════════════════════════════════════════════╝");
-        }
-        else
-        {
-            Console.WriteLine($"[ROULETTE] Message sent to {sentCount} Roulette client(s)");
-            if (failedCount > 0)
-            {
-                Console.WriteLine($"[WARNING] Failed to send to {failedCount} client(s)");
-            }
-        }
+        Console.WriteLine($"[ROULETTE SEND] {eventType} -> {sentCount} sent, {failedCount} failed");
     }
 
     // Broadcast message only to EGM clients
     static async Task BroadcastToEGMClientsAsync(string message, WebSocket excludeSender, string eventType = "")
     {
         WebSocketFileLogger.LogSent("EGM", eventType, message);
+
         var bytes = Encoding.UTF8.GetBytes(message);
-        var currentClients = new List<WebSocket>(clients);
+
+        // Snapshot to avoid collection-modified issues
+        List<WebSocket> currentClients;
+        lock (clients)
+        {
+            currentClients = new List<WebSocket>(clients);
+        }
+
         int sentCount = 0;
         int failedCount = 0;
 
         foreach (var client in currentClients)
         {
-            // Skip the sender (Roulette)
-            if (client != excludeSender && client.State == WebSocketState.Open)
+            if (client == null) continue;
+            if (client == excludeSender) continue;
+            if (client.State != WebSocketState.Open) continue;
+
+            // ✅ Only send to EGM clients (hard filter)
+            if (!clientTypes.TryGetValue(client, out var role) || !string.Equals(role, "egm", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
             {
-                // Only send to EGM clients
-                if (clientTypes.TryGetValue(client, out var clientType) && clientType == "egm")
+                await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+                sentCount++;
+            }
+            catch (Exception ex)
+            {
+                failedCount++;
+
+                // Remove dead sockets safely
+                lock (clients)
                 {
-                    try
-                    {
-                        await client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-                        sentCount++;
-                    }
-                    catch
-                    {
-                        clients.Remove(client);
-                        clientTypes.TryRemove(client, out _);
-                        failedCount++;
-                    }
+                    clients.Remove(client);
                 }
+                clientTypes.TryRemove(client, out _);
+
+                Console.WriteLine($"[EGM SEND ERROR] {eventType} -> removed client. Reason: {ex.Message}");
             }
         }
 
