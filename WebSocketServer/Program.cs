@@ -256,26 +256,43 @@ internal static class Program
         {
             case "session_initialized":
                 {
-                    // This is EGM -> Adapter message (camelcase), not the roulette format.
-                    // We generate roulette session_initialized and broadcast to roulette sockets.
-                    decimal availableCredits = 0m;
-                    if (root.TryGetProperty("payload", out var payload) &&
-                        payload.TryGetProperty("availableCredits", out var ac))
+                    long seq = NextSeq();   // 🔥 new adapter sequence
+
+                    // Parse into mutable dictionary
+                    var dict = JsonSerializer.Deserialize<Dictionary<string, object>>(rawMessage);
+
+                    if (dict == null)
+                        return;
+
+                    // Replace or add sequence
+                    dict["sequence"] = seq;
+
+                    // Update adapter state from EGM payload (optional but recommended)
+                    if (dict.TryGetValue("payload", out var payloadObj) &&
+                        payloadObj is JsonElement payloadElement &&
+                        payloadElement.TryGetProperty("availableCredits", out var ac))
                     {
-                        availableCredits = SafeGetDecimal(ac);
+                        _currentEgmBalance = SafeGetDecimal(ac);
                     }
 
-                    _currentEgmBalance = availableCredits;
                     _sessionInitializedFromEgm = true;
 
-                    await BroadcastSessionInitializedToRouletteAsync(availableCredits);
+                    var modifiedJson = JsonSerializer.Serialize(dict);
+
+                    await BroadcastToRoleAsync(
+                        ROLE_ROULETTE,
+                        modifiedJson,
+                        excludeSender: null,
+                        eventType: "session_initialized"
+                    );
+
                     break;
                 }
 
             case "BILL_INSERTED":
                 {
-                    decimal amount = GetDecimal(root, "amount", 0m);
-                    decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m);
+                    ulong amount = GetULong(root, "amount", 0);
+                    ulong currentCredits = GetULong(root, "CurrentCredits", 0);
                     string egmId = GetString(root, "egmId", "EGM-0441");
 
                     _currentEgmBalance = currentCredits;
@@ -317,8 +334,8 @@ internal static class Program
 
             case "AFT_DEPOSIT":
                 {
-                    decimal amount = GetDecimal(root, "Amount", 0m);
-                    decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m);
+                    ulong amount = GetULong(root, "Amount", 0);
+                    ulong currentCredits = GetULong(root, "CurrentCredits", 0);
                     string egmId = GetString(root, "egmId", "EGM-0441");
                     string aftReference = GetString(root, "AFTReference", "");
 
@@ -344,9 +361,9 @@ internal static class Program
                         {
                             aftTxnId,
                             originHost = "EGM-LOCAL",
-                            amount = (int)Math.Round(amount), // roulette expects int
+                            amount = (amount), // roulette expects int
                             authCode,
-                            remainingBalance = (int)Math.Round(currentCredits)
+                            remainingBalance = (currentCredits)
                         }
                     };
 
@@ -357,8 +374,8 @@ internal static class Program
 
             case "AFT_CASHOUT":
                 {
-                    decimal amount = GetDecimal(root, "Amount", 0m);
-                    decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m); // expected 0
+                    ulong amount = GetULong(root, "Amount", 0);
+                    ulong currentCredits = GetULong(root, "CurrentCredits", 0); // expected 0
                     string egmId = GetString(root, "egmId", "EGM-0441");
 
                     decimal egmBalanceBefore = _currentEgmBalance;
@@ -630,11 +647,12 @@ internal static class Program
     // =========================================================
     // Session + Balance helpers
     // =========================================================
-    private static async Task BroadcastSessionInitializedToRouletteAsync(decimal availableCredits)
+    private static async Task BroadcastSessionInitializedToRouletteAsync(string EventType)
     {
-        string egmId = "EGM-0441";
+        
         long seq = NextSeq();
 
+        /*
         var sessionEvent = new
         {
             @event = "session_initialized",
@@ -653,9 +671,10 @@ internal static class Program
                 version = new { egmBackend = "1.0.0", sasDaemon = "2.1.0" }
             }
         };
+        */
 
-        LogInfo($"[SESSION] Broadcast session_initialized -> roulette (credits={availableCredits})");
-        await BroadcastToRoleAsync(ROLE_ROULETTE, JsonSerializer.Serialize(sessionEvent), excludeSender: null, eventType: "session_initialized");
+        //LogInfo($"[SESSION] Broadcast session_initialized -> roulette (credits={availableCredits})");
+        await BroadcastToRoleAsync(ROLE_ROULETTE, JsonSerializer.Serialize(EventType), excludeSender: null, eventType: "session_initialized");
     }
 
     private static async Task SendSessionInitializedToSingleRouletteAsync(WebSocket rouletteSocket, decimal availableCredits)
@@ -788,6 +807,35 @@ internal static class Program
         if (root.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String)
             return v.GetString() ?? fallback;
         return fallback;
+    }
+
+    private static ulong GetULong(JsonElement root, string prop, ulong fallback)
+    {
+        if (!root.TryGetProperty(prop, out var v))
+            return fallback;
+
+        return SafeGetULong(v, fallback);
+    }
+
+    private static ulong SafeGetULong(JsonElement v, ulong fallback = 0UL)
+    {
+        try
+        {
+            return v.ValueKind switch
+            {
+                JsonValueKind.Number => v.TryGetUInt64(out var u) ? u : fallback,
+
+                JsonValueKind.String => ulong.TryParse(v.GetString(), out var u)
+                    ? u
+                    : fallback,
+
+                _ => fallback
+            };
+        }
+        catch
+        {
+            return fallback;
+        }
     }
 
     private static decimal GetDecimal(JsonElement root, string prop, decimal fallback)
