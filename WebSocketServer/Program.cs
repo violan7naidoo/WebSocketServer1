@@ -265,17 +265,17 @@ internal static class Program
                         availableCredits = SafeGetDecimal(ac);
                     }
 
-                    _currentEgmBalance = availableCredits;
+                    _currentEgmBalance = availableCredits*100;
                     _sessionInitializedFromEgm = true;
 
-                    await BroadcastSessionInitializedToRouletteAsync(availableCredits);
+                    await BroadcastSessionInitializedToRouletteAsync(availableCredits*100);
                     break;
                 }
 
             case "BILL_INSERTED":
                 {
-                    decimal amount = GetDecimal(root, "amount", 0m);
-                    decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m);
+                    decimal amount = GetDecimal(root, "amount", 0m)*100;
+                    decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m)*100;
                     string egmId = GetString(root, "egmId", "EGM-0441");
 
                     _currentEgmBalance = currentCredits;
@@ -284,7 +284,7 @@ internal static class Program
                     var roundId = $"round-{DateTime.UtcNow.Ticks}";
                     var seq = NextSeq();
 
-                    int denominationCents = (int)Math.Round(amount * 100m);
+                    int denominationCents = (int)Math.Round(amount);
 
                     var cashEvent = new
                     {
@@ -317,8 +317,8 @@ internal static class Program
 
             case "AFT_DEPOSIT":
                 {
-                    decimal amount = GetDecimal(root, "Amount", 0m);
-                    decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m);
+                    decimal amount = GetDecimal(root, "Amount", 0m)*100;
+                    decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m)*100;
                     string egmId = GetString(root, "egmId", "EGM-0441");
                     string aftReference = GetString(root, "AFTReference", "");
 
@@ -357,12 +357,12 @@ internal static class Program
 
             case "AFT_CASHOUT":
                 {
-                    decimal amount = GetDecimal(root, "Amount", 0m);
+                    decimal amount = GetDecimal(root, "Amount", 0m)*100;
                     decimal currentCredits = GetDecimal(root, "CurrentCredits", 0m); // expected 0
                     string egmId = GetString(root, "egmId", "EGM-0441");
 
                     decimal egmBalanceBefore = _currentEgmBalance;
-                    decimal egmBalanceAfter = currentCredits;
+                    decimal egmBalanceAfter = currentCredits+amount;
 
                     _currentEgmBalance = currentCredits;
 
@@ -585,14 +585,14 @@ internal static class Program
                     _lastRoundResultRoundId = roundId;
 
                     // Convert cents -> credits for EGM (EGM expects BetAmount/WinAmount in credits)
-                    int betCredits = _pendingBetStakeCents / 100;
-                    int winCredits = winAmountCents / 100;
+                    int betCredits = _pendingBetStakeCents;
+                    int winCredits = winAmountCents;
 
                     var gameUpdate = new
                     {
                         EventType = "GAME_UPDATE",
-                        BetAmount = betCredits,
-                        WinAmount = winCredits,
+                        BetAmount = betCredits/100,
+                        WinAmount = winCredits/100,
                         Timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
                         RoundId = roundId,
                         EgmId = egmId
@@ -677,7 +677,7 @@ internal static class Program
                 egmId,
                 jurisdiction = "NV",
                 currency = "ZAR",
-                availableCredits = (int)Math.Round(availableCredits),
+                availableCredits = (int)Math.Round(availableCredits*100),
                 aftAccountId = "AFT-12345",
                 playerClass = "Test",
                 version = new { egmBackend = "1.0.0", sasDaemon = "2.1.0" }
